@@ -22,6 +22,19 @@ This is the visualization/sonification system of people's heartbeat.
 - openFrameworks
 - GLSL shader(for beautiful visualization)
 
+## Microphone for DSP
+- wireless nicrophone with chest peace
+    - Hollyland A1 
+        - サンプルレート: 48kHz
+            - 理由: マイクシステムの伝送仕様（48kHz）に完全に一致させるため。openFrameworksの ofSoundStreamSetup() にて、入力サンプルレートとして 48000 を指定する。
+        - ビット深度: 24bit
+            - 理由: マイクシステムの伝送仕様（24bit）に一致させ、最大限のダイナミックレンジ（解像度）を確保するため。これにより、心音のような微細な信号を、ノイズフロアから分離して処理することが容易になる。
+        - 周波数特性（ベースライン）: 20Hz - 20kHz
+        - 信号対雑音比 (S/N比, ベースライン): 67dB 以上
+        - ofSoundStream::setup()）を呼び出す際、入力デバイス、入力チャンネル数（2ch）、サンプルレート（48000Hz）、バッファサイズを明示的に指定すること。
+        - オーディオバッファ（audioIn()）で受け取る float 型のサンプルは、24bitの解像度を持つデータとして扱われるため、後段のDSPアルゴリズム（フィルタ、エンベロープ検出）は、この高い解像度を前提に設計する。
+
+
 ## Purpose
 - 心音を多感覚で外化し、自己と他者の存在を静かに実感できる場をつくる。
 - 他者の心拍を共有することで、身体リズムの共鳴や相互理解を促す。
