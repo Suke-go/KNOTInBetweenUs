@@ -12,9 +12,11 @@
 | 実装ID | 作業内容 | 成果物/コミット | 記録リンク |
 | --- | --- | --- | --- |
 | SET-01 | ディレクトリ整備・テスト信号スクリプト | このコミット | docs/ENVIRONMENT_SETUP.md, scripts/generate_test_signals.py |
+| SET-01 | openFrameworks 0.12.1 ビルド確認 (警告既知) | このコミット | Xcode Debug ビルドログ |
 
 ## 3. KPI / 検証結果
 - ログ健全性: session.csv 行数 -, エラー 0 件 (Phase0 前段)
+- ビルド状況: of_v0.12.1 Debug 成功、既知警告 (OpenGL 非推奨 / `sprintf` / 未使用関数)
 - メモリ/CPU: Max - MB, 平均 CPU - %
 - 自動テスト: 実行 0 件 / 成功 0 件、CI 所要時間 -
 - KPI ダッシュボード更新日時: 未設定

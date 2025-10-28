@@ -6,7 +6,8 @@
 - Git, Python 3.10 以上
 
 ## 2. openFrameworks 0.12.0 の導入
-1. [official site](https://openframeworks.cc/download/) から `of_v0.12.0_osx_release.zip` をダウンロード。
+1. [official site](https://openframeworks.cc/download/) から `of_v0.12.0_osx_release.zip` をダウンロード。  
+   - 備考: `0.12.1` でもビルド検証済み。警告内容（OpenGL 非推奨、`sprintf`、未使用関数など）は既知のものとして扱い、将来的に Metal/`snprintf` への移行を検討する。
 2. 推奨パスに展開（例: `~/Developer/of_v0.12.0_osx_release`）。以降、このパスを `$OF_ROOT` と記載。（ /Users/ksk432/Developer/of_v0.12.0_osx_release に配置）
 3. `projectGenerator-osx/projectGenerator.app` を初回起動し、Gatekeeper 設定を解除。
 4. Xcode 用テンプレートをインストール:
@@ -72,4 +73,3 @@ python3 scripts/generate_test_signals.py
 - [ ] レポートフォーマット (`reports/member*/PROGRESS_REPORT.md`) を参照できる。
 
 完了後は `reports/memberC/PROGRESS_REPORT.md` に進捗を記述し、Slack で共有する。
-
