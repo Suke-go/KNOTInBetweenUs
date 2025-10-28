@@ -13,6 +13,8 @@ This is the visualization/sonification system of people's heartbeat.
     - a system to localize sound source
     - a system to simulate spatial characteristics
         - like reberberation of sound
+- audio licalization system
+    - calculate binaural audio
 - audio output system
     - output sound to speaker, subwoofer(for 4 channel with audio interface)
 - GUI
