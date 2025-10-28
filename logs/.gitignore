@@ -1,0 +1,5 @@
+# Runtime logs (ignored by default)
+*.csv
+*.json
+*.log
+

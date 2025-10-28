@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "createdUtc": "1970-01-01T00:00:00Z",
+  "notes": "Copy to channel_separator.json after running calibration. Values here are placeholders for development.",
+  "channels": [
+    {
+      "name": "CH1",
+      "gain": 1.0,
+      "phaseDeg": 0.0,
+      "delaySamples": 0
+    },
+    {
+      "name": "CH2",
+      "gain": 1.0,
+      "phaseDeg": 0.0,
+      "delaySamples": 0
+    }
+  ]
+}
+
