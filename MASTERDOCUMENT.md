@@ -78,12 +78,13 @@ This is the visualization/sonification system of people's heartbeat.
             - ripplesは白色，ripplesの円には一部noiseを入れる（noisy rateは5%-7%, random, per second）
                 - 動きに合わせて白の透明度合を変化させていく，中心から外に行けば行くだけ，薄くなっていく
                 - ripplesの一度に描画できる円の数は8つまで
-    - オペレータが「開始」ボタンを押下。
-    - 「体験を始めます」を10秒間表示
+    - Start Scene(30sec)
+        - オペレータが「開始」ボタンを押下。
+        - 「体験を始めます」を10秒間表示
         - 背景は黒色
             - 背景の中に星空のように白色のglowしている点を描画する
         - 日本語のフォントはNoto Sans JP Thinで単色白色
-    - play bell.wav
+        - play bell.wav(スタートから25sec後)
     - Start First Phase: 自分の心音を多感覚的に近くする（1min）
         - 各自に自身の心音を再生
             - それぞれ
@@ -94,7 +95,8 @@ This is the visualization/sonification system of people's heartbeat.
     - Exchange Heart Beat Phase：二人の参加者の心音を交換する
         
         - audio localizationを行う
-            - 
+            - participant1に対して、participant2の心音の音源を真右3Mの距離から鳴らす
+            - participant2に対して、participant1の心音を真左3mの距離から鳴らす
 
 
 
