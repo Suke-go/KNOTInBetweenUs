@@ -1,0 +1,12 @@
+{
+  "telemetry": {
+    "sessionCsv": "../logs/proto_session.csv",
+    "summaryJson": "../logs/proto_summary.json",
+    "hapticCsv": "../logs/haptic_events.csv",
+    "writeIntervalMs": 250,
+    "flushIntervalMs": 1000
+  },
+  "calibrationPath": "../calibration/channel_separator.json",
+  "enableSyntheticTelemetry": false,
+  "defaultScene": "Idle"
+}

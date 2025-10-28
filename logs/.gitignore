@@ -1,5 +1,3 @@
-# Runtime logs (ignored by default)
+# Session artifacts
 *.csv
 *.json
-*.log
-
