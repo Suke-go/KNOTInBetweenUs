@@ -2,27 +2,129 @@
 
 This is the visualization/sonification system of people's heartbeat. 
 
+## RULES FOR CODING
+- When responding to questions, always use either a critical or affirmative perspective.For A or Not A scenarios, if asked about A, explore the possibility of Not A; if asked about Not A, explore the possibility of A.When asked about non-generic domain knowledge, do not speculate—research it online.If context is lacking, do not fill in gaps arbitrarily—ask the user for clarification.
+- Do not resort to non-essential hacks to solve immediate problems, such as bypassing type errors by casting to `Any` or forcing network routes through iptables. Always remember the original challenge and consider why you are doing this.
+- Adding variables indiscriminately to ofApp.h is a design failure. The mindset that “access from anywhere is convenient” is the first step toward spaghetti dependencies. Determine who owns the data, who gets to see it (via const references), and who is allowed to modify it (via references). Design the data flow paths and pass it appropriately to functions.
+- Prohibit casts used to “silence” the compiler
+const_cast and C-style casts ((Hoge*)) fundamentally mask errors. There is always a reason why the compiler complains about constness or types. Don't force it to shut up with casts just to “make it work for now.” That's just postponing bugs.
+    - Can't remove const? → Question the design: Why must this function be const, or why are you trying to modify const data?
+    - Type mismatch? → Situations requiring reinterpret_cast are rare. Consider solving it with proper C++ features like polymorphism (inheritance) or std::variant (C++17).
+-  Don't shy away from CPU and GPU role division
+Stop thinking “Let's just iterate through pixels with a for loop for now.”Once you start implementing CPU-based image processing using ofPixels, constantly ask yourself: “Shouldn't this be parallelized on the GPU (GLSL/Shader)?” Conversely, if you're trying to write complex conditional branching or state management in shaders, ask yourself: “Shouldn't this logic be implemented straightforwardly on the CPU?”. Implementations lacking this A vs Not A perspective (CPU vs GPU) in performance-critical scenarios become technical debt.
+- See Memory and Resources Through to Their “Death”. If you new it, delete it. Clearly define ownership of raw pointers (*). Focus all your attention on ensuring objects new'd in setup() are deleted in exit() or destructors. Memory leaks are time bombs that will eventually crash your program. In modern C++, raw pointers with ownership are evil. Use std::unique_ptr to establish single ownership and std::shared_ptr to share ownership. Strictly enforce RAII (Resource Acquisition Is Initialization) for resources (files, textures, FBOs).
+- Don't implement things “just because”; read the documentation and headers.
+Don't use C++ specifications, OpenGL behavior, or oF functions based on “probably works like this.”Conjecture breeds bugs. If you're unsure about “What does this function return? What side effects does it have?”, consult the official documentation or, at the very least, read the header files (.h). oF headers are (relatively) easy to read. Similarly, don't tolerate “vaguely slow” performance. Wrap processing time with `ofGetElapsedTimeMicros()` and “measure” bottlenecks. Optimization based on guesswork only pollutes your code.
+
+## Recommended External Libraries
+- **Eigen (MIT License)**: Header-only linear algebra; use `Eigen::Matrix2f` + SVD でクロストーク行列の逆行列と条件数監視を行い、`ofApp` 周辺に数学ユーティリティをばら撒かない。
+- **moodycamel::ConcurrentQueue (Simplified BSD License)**: シングルヘッダのロックフリーキュー。リアルタイムスレッドから GUI/ビジュアルへ `BeatEvent` を渡す際にグローバル変数や待機系のミューテックスを避けられる。
+- **libmysofa (BSD License)**: MIT KEMAR SOFA を起動時に読み込む C ライブラリ。`std::unique_ptr` のカスタムデリータで RAII 化し、バイノーラル処理用の HRIR 参照を安全に提供できる。
+
 ## What need to be coded?
 - channel separator
-    - a system to separate channels(2ch input need to be independetly processed)
+    - Input: wireless 2ch float32 stream (48kHz / buffer 512 frames) from Hollyland A1。
+    - Calibration Flow:
+        - 先頭 5 秒間で基準トーンを再生。奇数フレームでは CH1、偶数フレームでは CH2 に 1kHz のサイン波（例: -12dBFS ≒ 振幅0.25）を順番に送る。
+        - 各チャンネルに同じテストパルス（例: 長さ 256 サンプル、矩形窓）を流し、到達ピーク時刻の差分から遅延を推定する。
+        - 校正処理の結果は `calibration/channel_separator.json` に保存し、キー `gain`, `phaseDeg`, `delaySamples` をチャンネルごとに記録する。
+    - Processing:
+        - audioIn() で取得したサンプルに C^-1 を乗算し、チャンネル独立性を担保する。
+        - 入力タイムスタンプを ofSoundBuffer::getTickCount() ベースで保持し、下流処理へ付与する（許容ジッター <= 1 フレーム）。
+    - Output: HeartbeatBus::channel[0/1]（モノラル）として DSP パイプラインに渡す。
+    - HeartbeatBus Layout:
+        - `HeartbeatBus::channel[0/1]` は `std::array<float, 512>` を想定し、各要素は -1.0～1.0 の正規化サンプル（例: 心音ピーク時に 0.6 程度）を格納する。
+        - バッファは `sequenceId`（uint64）と `timestampMicros`（int64）をセットで保持し、下流処理が並行読取できるようロックフリーキュー（例: moodycamel::ConcurrentQueue）に積む。
+    - Implementation Notes:
+        - クロストーク行列の逆行列計算時にコンディションナンバーを監視し、10^3 を超えた場合は Tikhonov 正則化（例: `CᵀC + 1e-4 I` を逆行列に渡す）で安定化する。
+        - チャンネル整列後は `HeartbeatBus` に push する前に 1 サンプル以下の遅延差を吸収するリングバッファを挟み、スレッド間で共有するときは ofThreadChannel を利用する。
 - signal processing system
-    - a system to count heartbeat from raw audio signal from microphone
+    - Input: HeartbeatBus（各参加者1系統）からの正規化済みモノラル信号。
+    - Pre-Processing: Signal Processing Algorithm セクションに従い、帯域通過・整流・包絡線抽出を行う。
+    - Feature Extraction:
+        - R-R 間隔（ms）と瞬時 BPM を算出。
+        - 30 秒間の移動窓で HRV（SDNN, RMSSD）を計算。
+    - Events:
+        - Rising Edge Detection により心拍イベント（BeatEvent）を生成し、タイムスタンプ・チャンネルID・強度（0-1）を付与。
+    - Output:
+        - `BeatTimeline`（過去90秒の心拍列）と `HeartbeatStats`（平均BPM, HRV, 直近ピーク強度）。
+        - `BeatTimeline` は 5ms グリッドで最大 18,000 イベントを保持し、1 行に `timestampMicros`, `rrIntervalMs`, `envelopePeak` を記録する（例: `{"timestampMicros":123456789,"rrIntervalMs":820,"envelopePeak":0.72}`）。
+        - `HeartbeatStats` は 250ms ごとに再計算し、`meanBpm`, `sdnnMs`, `rmssdMs` を更新する。ここで `sdnnMs` は標準偏差、`rmssdMs` は隣接差の二乗平均平方根（例: 42ms）を表す。
+    - Implementation Notes:
+        - BeatEvent 生成はリアルタイムスレッド内で完結し、GUI 側へは lock-free queue（例: moodycamel::ConcurrentQueue）で渡す。
+        - HRV 計算ウィンドウを可変にする場合に備え、`BeatTimeline` を循環バッファ実装にし、動的メモリアロケーションを避ける（例: `std::array<BeatSample, 18000>` を使いヘッドポインタをローテート）。
 - visualization system
+    - Render Target: ofFbo 1920x1080 / 60fps（プロジェクター 4K には 2x2 タイルで拡張可能）。
+    - Scenes: Idle, Start, First Phase, Exchange, Mixed, End の6シーンをシーンクラスで管理。
+    - Data Binding:
+        - BeatEvent を `VisualizationBus` に流し、半径 = baseRadius + k * envelope で波紋サイズを決定。
+        - `baseRadius` は 180px、`k` は 240px を基準値とし、最大半径 `maxRadius` を 420px に制限する（例: envelope=0.6 のとき半径=180+240*0.6=324px）。
+        - HRV -> トーラス変形パラメータ（平均値を基準に ±2σ でしきい値を設定）。
+    - Shader Requirements:
+        - GLSL 4.1 コア。星空パーティクルは instancing で 2000 点、ノイズは 4D simplex noise。
+        - トーラスシェーダで Warm カラーパレット（HSL）を時間で補間（周期60秒）。
+    - Implementation Notes:
+        - 描画と DSP のスレッドを分離した状態で `VisualizationBus` をダブルバッファにし、更新と描画が衝突しないようフレーム境界でスワップする。
+        - ofFbo の再初期化がシーン遷移時に起こらないよう、FBO をシングルトンで共有しリサイズはアプリ起動時だけに限定する。
 - audio synth system
-    - a system to add pink noise
-    - a system to localize sound source
-    - a system to simulate spatial characteristics
-        - like reberberation of sound
-- audio licalization system
-    - calculate binaural audio
+    - Pink Noise Generator: Voss-McCartney 法で 5 バンド、20Hz-20kHz。出力は -18dBFS 基準で正規化。
+    - Sound Source Localisation: 各参加者の Beats から trigger を受け、100Hz ローパス後の波形をアンプ包絡として利用。
+    - Spatial Simulation:
+        - Early Reflection: 4 タップ（5ms, 11ms, 17ms, 23ms）で -6dB, -8dB, -10dB, -12dB。
+        - Late Reverb: FDN 8x8、減衰時間 8.0s、HighCut 4kHz。
+    - Implementation Notes:
+        - リアルタイムスレッドで FDN を回すため、行列乗算を SIMD 化し、内部ステートはスタック配置の固定長配列を使用する。
+        - ミックスのゲイン管理は dB で記述したテーブルを `AudioSceneConfig` から読み込み、シーン遷移時にスムーズフェードで補間する。
+- audio localization system
+    - Binaural Rendering: MIT KEMAR HRIR を HRTF テーブルにプリロード。
+    - Positioning:
+        - participant1 -> 右 +3.0m（azimuth +90°, elevation 0°）。
+        - participant2 -> 左 -3.0m（azimuth -90°, elevation 0°）。
+    - Doppler: 心拍由来のミクロ変化は無視し、静的定位とする。
+    - Implementation Notes:
+        - HRIR テーブルは起動時に ofxBinaryMesh などから読み込み、リアルタイムスレッドではインデックス参照のみとし補間は線形補間で固定。
+        - Binaural 処理後はヘッドフォンとスピーカーの両方に対応できるよう、必要に応じてダウンミックスノードを組み込む。
 - audio output system
-    - output sound to speaker, subwoofer(for 4 channel with audio interface)
+    - Routing: 4ch audio interface（CH1/2 = Headphone A/B, CH3/4 = Subwoofer 1/2）。
+    - Leveling:
+        - Headphone: -12dBFS peak, Subwoofer: -6dBFS peak（LFE 強調）。
+        - 低域 (<80Hz) は Linkwitz-Riley 4次でサブに送る。
+    - Monitoring:
+        - GUI で瞬時 LUFS / Peak / TruePeak を表示。-0.3dBFS でシグナルタワー点灯。
+    - Implementation Notes:
+        - ofSoundStream は duplex モードで初期化し、`audioReceived` と `audioRequested` の同期を mutex-free で保てるようリングバッファでブリッジする。
+        - クロスオーバーフィルタは biquad の係数を事前計算して保持し、サブ信号を別バスで送る構成にすることで CPU 負荷を抑える。
 - GUI
+    - Layout: 1920x1080 タッチスクリーン前提。左ペインにシーンコントロール、右ペインにリアルタイム心拍可視化。
+    - Controls:
+        - シーン切替（Init/Idle/Start/Exchange/Mix/End）。
+        - 参加者ごとのゲイン・ノイズレベル・リミッタ閾値スライダー。
+        - Log Export ボタン（CSV）。
+    - Monitoring Widgets:
+        - BPM/HRV 数値、R-R プロット、ビートストレングスバー。
+        - オーディオレベルメータ（VU + LUFS）。
+    - Implementation Notes:
+        - GUI 更新はメインスレッドに限定し、DSP 側からのデータ受信は ofThreadChannel で非同期に行う。
+        - CSV エクスポートは書き込み専用スレッドを持たせ、UI ブロッキングを避けるためバッファリングしてから flush する。
 
 ## Technical Stuff
-- C++
+- C++17
+    - Xcode 15 / clang++ 15.0 を前提。`-std=c++17 -Wall -Wextra`。
+    - マルチスレッド処理は std::thread + ofThreadChannel を利用し、DSP と描画を分離。
 - openFrameworks
+    - 0.12.0（nightly）を推奨。アドオン: ofxMaxim, ofxGui, ofxAudioUnit, ofxCsv。
+    - プロジェクト設定で `OF_SOUNDSTREAM_NUM_BUFFERS = 4`、`OF_USING_GLM = 1`。
 - GLSL shader(for beautiful visualization)
+    - GLSL 4.1 Core Profile。macOS では OpenGL 4.1。
+    - トーラスシェーダは `shaders/torus.vert/.frag` に分割し、Ubo で HRV パラメータを渡す。
+- Assets/Config
+    - `/data/config/` に JSON 設定（filter, scene timing, gain table）。
+        - `audio_scene_config.json` はシーンごとのゲインと空間パラメータを保持し、トップレベルにシーン名をキーとして `{"mixDb":-12.0,"noiseDb":-24.0,"roomMix":0.42}` の形式で格納する（例: `{"Exchange":{"mixDb":-9.0,"noiseDb":-21.0,"roomMix":0.5}}`）。
+        - `scene_config.json` は遷移用パラメータをまとめ、`{"sceneId":"Exchange","crossfadeSeconds":1.5,"targetPose":{"distanceMeters":3.0,"azimuthDeg":90.0}}` のように JSON オブジェクトで記録する。
+    - `/data/audio/` に bell.wav, white_noise_base.wav。
+- Logging
+    - `logs/session_YYYYMMDD_HHMM.csv` に BeatEvent, BPM, HRV, SceneID を 100ms 間隔で追記。
+    - 再現性テストのため、`config/session_seed.json` に乱数シードを保存。
 
 ## Microphone for DSP
 - wireless nicrophone with chest peace
@@ -35,6 +137,15 @@ This is the visualization/sonification system of people's heartbeat.
         - 信号対雑音比 (S/N比, ベースライン): 67dB 以上
         - ofSoundStream::setup()）を呼び出す際、入力デバイス、入力チャンネル数（2ch）、サンプルレート（48000Hz）、バッファサイズを明示的に指定すること。
         - オーディオバッファ（audioIn()）で受け取る float 型のサンプルは、24bitの解像度を持つデータとして扱われるため、後段のDSPアルゴリズム（フィルタ、エンベロープ検出）は、この高い解像度を前提に設計する。
+        - 伝送遅延: メーカー仕様 20ms。ofxAudioUnit のタイムスタンプから実測し、補正オフセットを `micLatencyMs` としてGUIに表示する。
+        - 胸ピース固定位置マーカーを用意し、マイク位置ブレを 10mm 以内に保つためのガイドを作成する。
+        - キャリブレーション手順:
+            - 無信号状態で 10 秒ノイズフロアを記録し、平均値をオフセットとして保存。
+            - テストパルス（100Hz, -18dBFS）を再生して受信レベルを確認。-18 ±1dB 内に収まらない場合はゲイン補正。
+        - Implementation Notes:
+            - ノイズフロアは `AudioStats` 構造体に保持し、キャリブレーション後は値が変動した際に再計測を促す仕組みを入れる。
+            - 無線リンク状態は定期的に RSSI をポーリングし、閾値を下回ったら GUI に再接続アラートを表示する。
+            - 左右チャンネル差が大きい場合は自動ゲイン補正を適用し、調整量をログに記録する。
 
 
 ## Purpose
@@ -45,86 +156,185 @@ This is the visualization/sonification system of people's heartbeat.
 
 ## Signal Processing Algorithm
 - Normalization
-- add lowpass/highpass
-    - 20hz-150hz
-    - ofxMaxim
-        - maxiFilter
-- plus gain +15db
+    - 24bit 相当の float サンプル `s`（-1.0～1.0）に対し、内部表現 `s_norm = clamp(s / 0.95, -1.0, 1.0)`。
+    - 1 秒窓 (48000 samples) で RMS を算出し、-3dBFS を超えたら自動的にゲインを -6dB までフェードダウンさせる。
+- Band-Pass (20Hz-150Hz)
+    - ofxMaxim の maxiFilter を使用し、Butterworth 4次相当を LP/HP で構成。
+    - フィルタ係数は bilinear transform で事前算出し、JSON (config/filter.json) に保存。
+    - 遅延ライン: 4 サンプル、位相シフト <= 10° @80Hz を保証。
+- Gain Boost +15dB
+    - 線形ゲイン: `gain = pow(10.0, 15.0/20.0) ≈ 5.623`。
+    - `fabs(sample * gain)` が 0.98 を超える場合はソフトクリップ `tanh()` で飽和。
 - 半波整流
+    - `rectified = max(filteredSample, 0.0)`。
+    - 直流オフセットを 1st order HPF (fc=1Hz) で除去。
 - Envelope Detection
-    - フィルタを通った波形（filteredSample）のマイナス成分を0にクリップします。
-    - 整流したギザギザのサンプルを、ゆっくりと変化するエンベロープ（包絡線）にします(maxiEnv)。
+    - Attack: 5ms (`alpha_attack = exp(-1 / (0.005 * 48000))`)。
+    - Release: 150ms (`alpha_release = exp(-1 / (0.150 * 48000))`)。
+    - maxiEnv を envelope follower として使用し、`envelope = max(rectified, alpha * prevEnvelope)`。
 - Round Quantise
+    - 時間解像度 5ms（240 サンプル）にリサンプリング。
+    - `round(time / 0.005) * 0.005` で時間軸を量子化、BeatEvent の時間揺らぎを抑制。
 - Rising Edge Detection
+    - 動的なしきい値 `threshold = mean(envelope) + 1.5 * std(envelope)`（移動窓 2.5s）。
+    - 前回ビートから 250ms 未満はリフラクトリ期間として無視。
+    - しきい値交差時に速度 `slope = envelope[t] - envelope[t-1]` が 0.02 以上であればビート認定。
+- Heart Rate & HRV
+    - BPM: `60 / RR_interval[s]` を計算し、移動平均（窓 5 ビート）で平滑化。
+    - HRV 指標:
+        - SDNN: 1 分窓の RR 標準偏差。
+        - RMSSD: 隣接 RR 差分の平方平均平方根。
+    - `BeatTimeline` には RR, BPM, EnvelopePeak を格納し、GUI/Visualization へ提供。
+- Implementation Notes:
+    - 正規化やゲイン制御はリアルタイムスレッドで行うため、分岐を最小限にし `std::max` などの関数呼び出しを避ける。
+    - Envelope Detection 以降は固定小数を想定した数値範囲で動くため、`float` で完結させ double 変換を挟まない。
+    - Rising Edge Detection の閾値リセットは scene 切替時に手動で行い、前シーンのバッファが残らないように `reset()` を提供する。
+
+## Audio Localization Algorithm
+- HRTF Assets
+    - Dataset: MIT KEMAR (azimuth -180°～+180° / step 5°, elevation -40°～+90°) を `/data/hrir/mit_kemar/` に配置。
+    - `HrtfDatabase::load(const std::string& path)` で左右 HRIR を `std::vector<float>` として読み込み、サンプルレート 48kHz に合わせて補間（必要なら線形補間で再サンプリング）。
+    - 参照ライブラリ: `libmysofa`（SOFA ファイル読み込み）、`ofxAudioUnitHRTF`（FIR ベースの HRTF 適用）。いずれかをフォークして HRIR ローダとフィルタ管理を実装する。
+- Direction Mapping
+    - `HrtfIndex HrtfDatabase::resolve(float azimuthDeg, float elevationDeg)` を用意し、以下で最寄りの格子点を返す。
+        - `azIdx = round(clamp((azimuthDeg + 180.f) / 5.f, 0.f, 72.f))`
+        - `elIdx = round(clamp((elevationDeg + 40.f) / 5.f, 0.f, 26.f))`
+    - 2D インデックスで `HrtfPair`（L/R FIR）を取得。将来的なスムーズ移動に備え、隣接4点を返す `resolveNeighbourhood()` も実装。
+- Core Processing
+    - `void BinauralProcessor::prepare(size_t blockSize)`  
+        - HRIR 長に合わせて `Convolver`（オーバーラップアド FFT）を初期化。`fftSize = nextPow2(blockSize + hrirLength - 1)`。
+    - `void BinauralProcessor::setDirection(float azimuth, float elevation)`  
+        - `HrtfDatabase` から該当 HRIR を取得し、左右コンボルバにセット。方向が変化した場合はフェード時間 50ms でクロスフェード。
+    - `void BinauralProcessor::processBlock(const float* in, float* outL, float* outR, size_t numSamples)`  
+        - オーバーラップアド法で HRIR と入力信号を畳み込み。  
+        - 擬似コード:
+            ```
+            tmpL = convolverL.process(in, numSamples);
+            tmpR = convolverR.process(in, numSamples);
+            for i in range(numSamples):
+                outL[i] = tmpL[i] * gainL;
+                outR[i] = tmpR[i] * gainR;
+            ```
+        - `gainL/gainR` はヘッドフォンごとの補正係数。心拍のダイナミクスに合わせて -6dB～0dB を許容。
+- Distance & Filtering
+    - 距離 3m 相当の減衰は逆二乗則 `atten = 1.f / max(1.f, distanceMeters)` で求め、低域は 150Hz 以下を +2dB ブースト、高域は 6kHz 以上を -3dB。
+    - 周波数依存吸収は IIR（Shelving EQ）で実装し、`BiquadFilter::setShelving(ShelvingType::High, fc=6000Hz, gain=-3dB)` を各チャンネルに適用。
+- Crossfade Between Scenes
+    - `SceneCrossfade` から渡されるフェード係数 `alpha` を受取り、旧 HRIR 出力と新 HRIR 出力を `out = (1-alpha)*old + alpha*new` でブレンド。
+    - 方向変更頻度が高い場合に遅延を最小化するため、クロスフェードは 32 サンプル単位の小分けで処理。
+    - `SceneCrossfade` は `float SceneCrossfade::query(SceneId current, SceneId next, double nowSeconds)` を公開し、音声・ビジュアル・ハプティクスが同じ `alpha` を共有できるようにする（例: `query(SceneId::Exchange, SceneId::Mixed, 12.5)` が 0.6 を返し、60% 新シーンへ寄せる）。
+- Downmix / Routing
+    - ヘッドフォン向け: `outL/outR` を直接出力。
+    - スピーカー向け: `BinauralProcessor::toQuad(outL, outR, quadOut[4])` で Ambisonics Lite 変換を行い、CH1/2 にステレオ、CH3/4 にサブを送る。
+- Implementation Notes:
+    - コンボルバは `fftwf` または `KissFFT` ベースで実装し、リアルタイムスレッド内でメモリアロケーションが発生しないよう事前確保する。
+    - ヘッドフォン補正係数はキャリブレーションシーンで 1kHz のサイン波（例: -12dBFS ≒ 振幅0.25）を両耳に流し、オペレータが左右均衡を感じたときのゲイン値を `headphone_calibration.json` に保存する。
+    - HRIR の更新は audio スレッドに負荷を掛けないよう `PendingHrir` バッファを準備し、メインスレッドでロード → audio スレッドでスワップの二段階にする。
+    - HRTF テーブルの再時計算を避けるため、azimuth/elevation の組合せをハッシュ化し LRU キャッシュに保持する。
 
 ## UX
 - 開始準備
     - Init Scene(最初だけ)
+        - Duration: 約45秒（機材チェック込み）。
         - Speaker Selection(play pink noise)
-            - Headphone 1
-            - Headphone 2
-            - Bass Speaker 1
-            - Bass Speaker 2
+            - Headphone 1, Headphone 2, Bass Speaker 1, Bass Speaker 2 を順番に 5 秒ずつループ。
+            - GUI で対象スピーカーを点灯表示し、オペレータが物理的に確認する。
+            - ピンクノイズレベル: -18dBFS、周波数帯域 20Hz-20kHz。
+            - Implementation Notes:
+                - オーディオレベルメータは `AudioMonitor` クラスで共通化し、スピーカーごとのゲイン係数を config から取得する。
+                - スピーカー切替時にバッファクリアを行い、前スピーカーの残響が残らないよう ofSoundBuffer::set(0) を呼ぶ。
         - Init microphone
-            - visualize signals
+            - 胸ピース装着後、30 秒のウォームアップでノイズフロアを計測。
+            - GUI 上で raw waveform + band-pass waveform + envelope をオーバーレイ表示。
             - separate channels(these are recognized single microphone but it has 2 channels)
                 - microphone 1
                 - microphone 2
+            - Implementation Notes:
+                - キャリブレーション後の Envelope 振幅を `MicCalibrationState` に保存し、異常値が出た場合は自動で再キャリブレーションダイアログを出す。
+                - クロストーク除去フィルタを有効/無効にするトグルを GUI に配置し、デバッグ時に直接切り替えられるようにする。
     - Idle状態
-        - 常時マイクからの入力をripplesとして表現する(心音のチェック)
-            - ripplesはcountheartrateクラスによってcountedされた心音のピーク
-                - つまり心音がきちんと入力されているか，されていないかを目視できるようなシステム
-            - ripplesのもとは全画面に対して，中心-画面端の中間位置で二つ配置する
-            - 背景は黒色
-                - 背景の中に星空のように白色のglowしている点を描画する
-            - ripplesは白色，ripplesの円には一部noiseを入れる（noisy rateは5%-7%, random, per second）
-                - 動きに合わせて白の透明度合を変化させていく，中心から外に行けば行くだけ，薄くなっていく
-                - ripplesの一度に描画できる円の数は8つまで
-    - Start Scene(30sec)
-        - オペレータが「開始」ボタンを押下。
-        - 「体験を始めます」を10秒間表示
-        - 背景は黒色
-            - 背景の中に星空のように白色のglowしている点を描画する
-        - 日本語のフォントはNoto Sans JP Thinで単色白色
-        - play bell.wav(スタートから25sec後)
-    - Start First Phase: 自分の心音を多感覚的に近くする（1min）
-        - 各自に自身の心音を再生
-            - それぞれ
-            - 100Hzでローパスされた心音リズムに同期した振動で調和を促進
-        - 背景は黒色
-            - 背景の中に星空のように白色のglowしている点を描画する
-            - 全体の面積を中心線（x軸｜縦軸）で区切ってその中にプロットされている星空のパルスがcountheartrateによってcountされるたびにglowする感じ
-    - Exchange Heart Beat Phase：二人の参加者の心音を交換する
-        
-        - audio localizationを行う
-            - participant1に対して、participant2の心音の音源を真右3Mの距離から鳴らす
-            - participant2に対して、participant1の心音を真左3mの距離から鳴らす
-
-
-
-音: 特別な演出は加えず静寂を維持。
-視覚アイデア: 初期に検出されたHRVの平均値を基準に、偏差量で歪む紐状のリングを表示（結び目やアメーバ状の変形）。時間経過に合わせて暖色系の多層グラデーションを重ね、彩度・透明度を滑らかに遷移させる。
-未充足: トーラスのシェーダ実装や変形パラメータの定義、カウント表示のレイアウト（中央固定or周辺配置）。
-
-心音交換フェーズ（約1分）
-遷移: フェード＋高周波音でシームレスにモード切替。
-音: 相手の心音を自身のチャンネルで再生、ホワイトノイズをミックス。
-ビジュアル: 相手の心音に基づくシーンに切替（具体的演出不明）。
-未充足: ホワイトノイズのレベル、遷移時間、定位の扱い（左右入替など）の仕様。
-混在フェーズ
-音: 自身の心音とホワイトノイズを基調に、ホワイトノイズは心音より約20%高いレベルで設定。インスペクター上で心音/ノイズ比率を微調整できるようにする。
-相手心音演出:
-Binauralモード＋3次元音源配置で定位し、距離情報を強調。
-原音レベルは抑え、Francois–Garrison式を用いた周波数依存吸収を距離に応じて適用し、高域が徐々に減衰する響きを作る。
-巨大空間の残響: Early reflectionsとLate tailを分離し、後者はFDNベースで約8秒の長いリバーブを合成。
-Mid/Side処理で原音はMid寄せ、残響はSideを広げて包囲感を演出（IACC低下による包まれ感）。
-サイドチェイン・コンプレッションで原音が鳴る瞬間に残響を柔らかくダッキングし、モワつきを抑制。
-デエッサー＋Tilt EQで高域の勾配を整え、最後にルックアヘッド・リミッタで突発ピークを制御。
-触覚: 基本は自分の心音に同期。相手成分を重ねるかどうかは要検討。
-シーン管理: ミックス比や空間パラメータは共通スクリプトで保持し、シーン遷移時にクラス値を更新してデフォルトゲインやエフェクト設定を切り替える。リアルタイム心音振幅に応じたマスタゲイン自動調整も検討。
-ビジュアル: 両者の心拍データから生成されるビジュアルを鑑賞。
-音素材: 使用する基底音素材は全シーン共通。心音はリアルタイム取得値を使用するため変動がある。
-終了処理
-表示: 体験終了メッセージと退出案内。
-音: 心音フェードアウト後に穏やかなアンビエントor静寂を提示。
-未充足: 終了後のシステム状態（自動でキャリブレーションへ戻るか、待機画面へ遷移するか）とログ保存手順。
+        - 常時マイクからの入力を ripples として表現（心音のチェック）。
+        - 配置: 画面幅の 0.3, 0.7 の位置に半径 180px 基準の円を描く。
+        - ripple 半径 = `baseRadius + envelope * 240`、透過度 = `1.0 - distanceFromCenter / maxRadius`。
+        - noisy rate: 5%-7%/s でノイズテクスチャを更新、glsl で perlin ノイズを適用。
+        - 背景: 黒 + 星空パーティクル 1500 点、輝度は envelope に応じて 0.3-0.8 でモジュレーション。
+        - Audio: マイク入力をミュートし、-60dBFS の環境ノイズのみ（静寂を維持）。
+        - Implementation Notes:
+            - ビートが一定時間検出されない場合のフェールセーフは `BeatTimeline::isSilent()` として実装し、UI 表示を制御する。
+            - ノイズテクスチャの更新頻度はタイマーで制御し、フレームレートが落ちた場合は自動で更新間隔を伸ばす。
+- Start Scene(30sec)
+    - オペレータが「開始」ボタンを押下。
+    - Timeline:
+        - t=0s: 「体験を始めます」テキスト（Noto Sans JP Thin, 120pt, #FFFFFF）をフェードイン（1s）。
+        - t=10s: テキストフェードアウト（1s）。
+        - t=12s-20s: 参加者へ深呼吸ガイダンス（静止画）を表示。
+        - t=25s: bell.wav（-12dBFS, 2.0s リリース）を再生。
+        - t=30s: 自動で Start First Phase へ遷移。
+    - Visuals: Idle と同じ星空 + テキスト。ガイダンスの透明度を 0.6→0.0 に線形補間。
+    - Implementation Notes:
+        - Scene タイマーは `SceneController` 内で高分解能クロックを使用し、遷移イベントを定数表からスケジュールする。
+        - bell.wav 再生は `AudioCuePlayer` 経由で行い、他シーンでも使えるようキューサブシステムを共通化する。
+- Start First Phase: 自分の心音を多感覚的に知覚する（1min）
+    - Duration: 60s。
+    - Audio:
+        - 各参加者に自身の心音（100Hz ローパス済み）を -15dBFS でヘッドフォン再生。
+        - Pink noise を -24dBFS で薄くミックス（S/N = +9dB）。
+    - Haptics:
+        - 振動モーターを背面クッションに設置。`vibration_amp = clamp(envelope * 0.8, 0, 1)`。
+        - 心拍検出から振動トリガまでのレイテンシ 80ms 以下。
+    - Visuals:
+        - 背景星空を中心線（x軸｜縦軸）で分割し、各領域で参加者の HRV に応じたパルスを発光。
+        - トーラスシェーダの `knotDeform = normalize(HRV - HRV_baseline)` を 0.0-0.5 で変化。
+        - `HRV_baseline` はシーン開始後 20 秒間の RMSSD 平均を静止値とし、その値を基準 0.0 と定義する（例: ベースライン 38ms、現在値 50ms の場合 `normalize` 入力は +12ms）。
+    - Implementation Notes:
+        - Haptics 用のトリガはメインスレッドで発火すると遅延が出るため、BeatEvent 受信直後に `HapticBus` へ書き込む仕組みを用意する。
+            - `HapticBus` は `struct HapticEvent { uint64 beatId; float intensity; uint32 holdMs; }` 形式とし、例として intensity=0.8, holdMs=120 のイベントを GUI とデバイス制御で共有する。
+        - BPM 変動に応じてビジュアル速度を補正する場合は lerp 係数を HRV ベースで求め、急激な変化を避けるスローフィルタを挟む。
+- Exchange Heart Beat Phase：二人の参加者の心音を交換する
+    - Duration: 60s。Start First Phase から 2s フェードで遷移。
+    - Audio localization を行う:
+        - participant1 に対して、participant2 の心音の音源を真右 3m（azimuth +90°）。
+        - participant2 に対して、participant1 の心音を真左 3m（azimuth -90°）。
+        - ホワイトノイズ: -21dBFS、相手心音に対して -6dB。左右独立の HRTF を適用。
+        - 遷移時に高周波スウィープ（8kHz → 200Hz, 1.5s）を  -24dBFS で再生。
+    - Visuals:
+        - HRV の平均値を基準に紐状のリング（トーラス）を表示し、偏差からねじれを生成。
+        - 彩度/透明度は 60 秒周期で暖色グラデーションを補間。
+        - BeatEvent 発生で相手側リングが瞬間的に 1.2 倍膨張。
+    - Haptics: 自身の振動は停止。相手心音に同期した LED（ウォームホワイト）を 200ms 点灯。
+    - White Noise Mix:
+        - ホワイトノイズは -21dBFS（例: 振幅約0.089）で固定し、相手心音に対して -6dB のレベル差を維持する。GUI のスライダーは ±3dB の微調整幅だけ許容する。
+    - Visual Layout:
+        - リングは画面中心から左右に ±320px オフセットして配置し、視線の交差点（例: 中央 0px）には共有ノードを描画する。
+    - Implementation Notes:
+        - シーン遷移用のフェードは `SceneCrossfade` コンポーネントで管理し、音声/ビジュアル/LED をまとめて制御する。
+        - Binaural 処理後のゲインは `HeadphoneMix` クラスで正規化し、左右差が大きい場合の補正パラメータも保存する。
+- 混在フェーズ（約90秒）
+    - Audio:
+        - `processMixedPhaseAudio(selfBeat, partnerBeat, sceneConfig)`：混在フェーズ専用のマスター関数。以下の処理ノードを順番に実行し、最終的な 2ch 出力バッファを返す。
+        - `mixSelfHeartbeat(selfBeat, noiseGainRatio=1.2)`：自心音（RMS 参照）を Mid 成分に束ね、+20%（+1.58dB）でホワイトノイズを重ねる。ノイズは `sceneConfig.selfNoiseLUT` を参照し、BPM 変動時は 250ms スムージングで追従。
+        - `renderPartnerHeartbeat(partnerBeat, pose)`：Binaural レンダラーへ入力する前段。`pose`（距離=3.0m, azimuth=±90°, elevation=0°）を受け取り、音源ごとに `calcSpatialParams(pose)` を呼び出して ITD/ILD/拡散度を求める。
+        - `calcSpatialParams(pose)`：Francois–Garrison 式による高域減衰を `fgAbsorption(freqHz, distanceMeters)` で計算（温度20℃, 湿度50% を固定パラメータ）。距離 d に対して 6kHz の減衰基準 `attenuationDb = clamp(-6 * (d / 3.0), -12, 0)` を設け、Binaural HRIR へ掛けるハイシェルフ係数を決定。併せて `calcInterauralTimeDiff(pose)` と `calcInterauralLevelDiff(pose)` を返却する。
+        - `synthesizeMacroReverb(dryStereoBuffer, config)`：巨大空間リバーブ。Early reflections はタップ {5,11,17,23}ms にゲイン {-6,-8,-10,-12}dB を適用。Late tail は FDN 8x8（T60=8.0s, HighCut=4kHz）で生成し、Early と Late のブレンド比は `config.roomMix`（既定0.42）で制御。
+        - `applyMidSideProcessing(dryMid, wetSide)`：Mid/Side 変換で原音を Mid に保持し、残響を Side に 3dB ブースト。`sidechainDucker(envelope=dryMid)` を併用し、原音がピークの際は残響 Side を -4dB まで減衰（リリース120ms）。
+        - `applyDynamicsChain(inputStereo)`：最終段のダイナミクス。`deesser(fc=6kHz, ratio=4:1, lookahead=5ms)` → `tiltEq(pivot=400Hz, slope=+1.5dB/Oct)` → `lookaheadLimiter(attack=0.5ms, release=50ms, lookahead=5ms)` の順で直列適用し、出力ピークを -3dBFS に保持する。
+    - Visuals:
+        - 双方の BeatTimeline をレイヤー合成し、中心に共有ノード（相互距離を色相にマッピング）。
+        - HRV 差分 > 20ms の場合、色温度を 3000K→2000K にシフトし関係性を強調。
+    - Haptics:
+        - 基本は自分の心音に同期。相手成分を 30% 混ぜるモードを GUI トグルで選択。
+    - シーン管理:
+        - ミックス比・空間パラメータを SceneConfig JSON から読込。遷移時はスムーズステップ（1.5s）で補間。
+        - BeatTimeline を共通スクリプトで保持し、ビジュアル/オーディオ/ハプティクスへ同時配信。
+            - `BeatTimelineService` シングルトンが `const BeatTimeline& BeatTimelineService::snapshot()` を公開し、各システムが同じ参照時刻で読み取る（例: `snapshot().latest().bpm` で現行 BPM を取得）。
+    - Implementation Notes:
+        - ルックアヘッドリミッタは 5ms のディレイバッファを使用するため、シーン中の総遅延に加算し audio output system と整合を取る。
+        - GUI のフェーダー操作は補間関数を介して DSP スレッドに反映し、ステップ状の変化が起きないよう指数曲線でスムージングする。
+- 終了処理
+    - 表示: 「体験は終了しました」「ゆっくりご退出ください」を 20 秒表示。
+    - Audio: 心音フェードアウト（10 秒, -3dB/s）→ アンビエント（-30dBFS, 5 秒）→ 無音。
+    - Logging: Scene 終了時に session CSV をクローズし、`logs/summary.json` に BPM 平均・HRV を追記。
+    - 次シーン移行: 15 秒後に Idle Scene へ戻り、再キャリブレーションを促すポップアップ。
+    - Implementation Notes:
+        - ログファイルのサイズが肥大化しないよう、`LogWriter` は古いセッションをローテーションし一定数で削除する。
+        - 終了処理では ofSoundStream を stop した後にデバイスリストを再列挙し、次セッションでのデバイススリープを検知する。
