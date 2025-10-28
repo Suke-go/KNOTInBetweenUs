@@ -27,6 +27,13 @@ public:
     bool isCalibrationActive() const;
     bool calibrationReady() const;
     const std::array<ChannelCalibrationValue, 2>& calibrationResult() const { return calibrationValues_; }
+    void setNoiseSeed(std::uint32_t seed);
+
+    void startEnvelopeCalibration(double durationSec);
+    bool isEnvelopeCalibrationActive() const;
+    float envelopeCalibrationProgress() const;
+    BeatTimeline::EnvelopeCalibrationStats lastEnvelopeCalibration() const;
+    bool pollEnvelopeCalibrationStats(BeatTimeline::EnvelopeCalibrationStats& stats);
 
     void audioIn(const ofSoundBuffer& buffer);
     void audioOut(ofSoundBuffer& buffer);
@@ -62,6 +69,9 @@ private:
     std::normal_distribution<float> noiseDist_{0.0f, 1.0f};
     BeatMetrics metrics_{};
     std::deque<BeatEvent> pendingEvents_;
+    BeatTimeline::EnvelopeCalibrationStats lastEnvelopeCalibration_{};
+    bool envelopeCalibrationActive_ = false;
+    bool newEnvelopeCalibrationAvailable_ = false;
 
     double totalSamplesProcessed_ = 0.0;
     float limiterReductionDb_ = 0.0f;

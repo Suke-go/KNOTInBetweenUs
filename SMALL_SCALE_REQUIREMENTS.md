@@ -246,6 +246,11 @@
   - ピーククラスタリングやイベント強度フィルタを導入し、`scripts/validate_logs.py` で BPM 誤差 ±3 BPM を達成する。  
   - 対応後の `logs/proto_session.csv` と `logs/proto_summary.json` を提出し、誤検出率と RMSSD/SDNN の改善を記録する。
 
+- **Envelope Baseline キャリブレーション**  
+  - `Envelope Baseline 計測` ボタンで 3 秒間の包絡値を収集し、平均・最大・推奨トリガ比を `BeatTimeline` に反映する。  
+  - 計測結果は `calibration_report.csv` に追記し、`validate_logs.py --calibration-report` で peak/mean 比が 1.15 以上であることを確認する。  
+  - 計測成功率（3 回中成功 2 回以上）と再検出率（未検出復帰時間）を KPI としてレポートへ記載する。
+
 - **GUI/UX 改修指針**  
   - シーン遷移とエンベロープを監視できるサブパネル（小ウィンドウやポップアウト）を追加し、フェード中やキャリブレーション中の状態が一目で分かるようにする。  
   - キャリブレーション中に操作が無効化される理由や、検出強度が弱い際のガイダンスを GUI 上に明示する。  

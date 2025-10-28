@@ -15,6 +15,7 @@
 | --- | --- | --- | --- |
 | CAL-01/CAL-02 | キャリブレーション信号生成・解析クラス `CalibrationSession` 実装、ofApp からキャリブレーション起動/保存を連携 | `src/audio/Calibration.*`, `src/audio/AudioPipeline.*`, `src/ofApp.cpp` | - |
 | DSP-01 | BeatTimeline 処理チェーン（HPF→LPF→包絡→動的閾値）と ofApp GUI 連携、リフラクトリ期間/強度フィルタで誤検出抑制 | `src/audio/BeatTimeline.*`, `src/audio/AudioPipeline.*`, `src/ofApp.cpp` | - |
+| DSP-01b | 包絡キャリブ API + フェイルセーフ（未検出時に閾値緩和）実装、UI 連携 | `src/audio/BeatTimeline.*`, `src/audio/AudioPipeline.*`, `src/ofApp.*` | - |
 | AUD-01/AUD-02 | 自心音 + ホワイトノイズ合成、簡易リミッター適用、Limiter 減衰メータ表示、ステータスパネル表示 | `src/audio/AudioPipeline.cpp`, `src/ofApp.cpp` | - |
 | DSP-01/DSP-02 | `scripts/validate_logs.py` に BPM 誤差・キャリブレーション判定チェックを追加 | `scripts/validate_logs.py` | - |
 
@@ -32,6 +33,7 @@
 - [ ] DSP-02: BeatEvent 精度検証（録音データでの BPM 誤差算出、±3 BPM 達成証跡）
 - [ ] CAL-01/02: 実測ログ採取と JSON 出力の誤差評価（`calibration_report.csv` 追記＆外れ値調査）
 - [ ] AUD-02: リミッター挙動と GUI チャート可視化の性能評価（30 分連続稼働テスト）
+- [ ] DSP-01b: Envelope ベースライン計測の実測検証（minTriggerRatio ≥ 1.15 を維持）
 
 ## 6. 添付資料
 - 記録ファイル: `logs/...`

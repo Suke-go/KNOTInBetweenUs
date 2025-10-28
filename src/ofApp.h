@@ -9,7 +9,9 @@
 #include "audio/AudioPipeline.h"
 #include "infra/TelemetryLogging.h"
 
+#include <array>
 #include <filesystem>
+#include <optional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -41,6 +43,7 @@ private:
     void onStartButtonPressed();
     void onEndButtonPressed();
     void onResetButtonPressed();
+    void onEnvelopeCalibrationButtonPressed();
 
     // Update helpers
     void updateSceneGui(double nowSeconds);
@@ -49,6 +52,9 @@ private:
     void applyBeatMetrics(const knot::audio::AudioPipeline::BeatMetrics& metrics, double nowSeconds);
     void handleBeatEvents(const std::vector<knot::audio::BeatEvent>& events, double nowSeconds);
     void appendHapticEvent(double nowSeconds, float intensity, const std::string& label);
+    void updateEnvelopeCalibrationUi(double nowSeconds);
+    void initializeSessionSeed();
+    static bool ensureParentDirectory(const std::filesystem::path& path);
 
     // Drawing helpers
     void drawScene(SceneState state, float alpha, double nowSeconds);
@@ -57,8 +63,16 @@ private:
     void drawEndScene(float alpha);
     void drawEnvelopeGraph(const ofRectangle& area) const;
     void drawHapticLog(const ofRectangle& area, double nowSeconds) const;
+    void drawHapticChart(const ofRectangle& area, double nowSeconds) const;
     void drawCalibrationStatus() const;
     void drawBeatDebug() const;
+    void appendCalibrationReport(const std::array<knot::audio::ChannelCalibrationValue, 2>& values,
+                                 const std::optional<knot::audio::EnvelopeCalibrationStats>& envelopeStats);
+    std::string makeCalibrationStatusText() const;
+    bool isInteractionLocked() const;
+    std::string buildGuidanceMessage(double nowSeconds) const;
+    float computeHapticRatePerMinute(double nowSeconds) const;
+    void logEnvelopeCalibrationResult(const knot::audio::EnvelopeCalibrationStats& stats);
 
     // UI + state
     SceneController sceneController_;
@@ -75,6 +89,18 @@ private:
     ofxButton startButton_;
     ofxButton endButton_;
     ofxButton resetButton_;
+    ofxButton envelopeCalibrationButton_;
+    ofxPanel statusPanel_;
+    ofParameter<std::string> sceneOverviewParam_;
+    ofParameter<float> transitionProgressParam_;
+    ofParameter<std::string> timeInStateParam_;
+    ofParameter<float> envelopeMonitorParam_;
+    ofParameter<float> hapticRateParam_;
+    ofParameter<std::string> calibrationStateParam_;
+    ofParameter<float> limiterReductionParam_;
+    ofParameter<std::string> guidanceParam_;
+    ofParameter<float> baselineEnvelopeParam_;
+    ofParameter<float> envelopeCalibrationProgressParam_;
 
     double lastEnvelopeSampledAt_ = 0.0;
     double lastSimulatedBeatAt_ = 0.0;
@@ -85,15 +111,23 @@ private:
     std::uint64_t lastTelemetryMicros_ = 0;
     std::uint64_t sessionStartMicros_ = 0;
     std::uint64_t beatCounter_ = 0;
+    std::uint64_t sessionSeed_ = 0;
     bool simulateTelemetry_ = false;
 
     ofSoundStream soundStream_;
     bool soundStreamActive_ = false;
     knot::audio::AudioPipeline audioPipeline_;
     std::filesystem::path calibrationFilePath_;
+    std::filesystem::path calibrationReportPath_;
+    std::filesystem::path sessionSeedPath_;
     double sampleRate_ = 48000.0;
     std::size_t bufferSize_ = 512;
     bool calibrationSaved_ = false;
     bool calibrationSaveAttempted_ = false;
+    bool calibrationReportAppended_ = false;
+    bool envelopeCalibrationRunning_ = false;
+    std::optional<knot::audio::EnvelopeCalibrationStats> lastEnvelopeCalibrationStats_;
     float limiterReductionDbSmooth_ = 0.0f;
+    double lastStrongSignalAt_ = 0.0;
+    bool weakSignalWarning_ = false;
 };

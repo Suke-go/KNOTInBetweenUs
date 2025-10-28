@@ -3,7 +3,11 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
+#include <limits>
+#include <optional>
+#include <random>
 #include <sstream>
 #include <system_error>
 #include <vector>
@@ -37,18 +41,6 @@ std::string sceneToString(SceneState state) {
     return "Unknown";
 }
 
-void ensureDirectory(const std::filesystem::path& filePath) {
-    const auto parent = filePath.parent_path();
-    if (parent.empty()) {
-        return;
-    }
-    std::error_code ec;
-    std::filesystem::create_directories(parent, ec);
-    if (ec) {
-        ofLogWarning("ofApp") << "Failed to create directory " << parent << ": " << ec.message();
-    }
-}
-
 }  // namespace
 
 void ofApp::setup() {
@@ -62,6 +54,15 @@ void ofApp::setup() {
     hapticLogger_ = std::make_unique<infra::HapticEventLogger>(appConfig_.telemetry.hapticCsvPath);
 
     calibrationFilePath_ = appConfig_.calibrationPath;
+    calibrationReportPath_ = appConfig_.calibrationReportCsvPath;
+    sessionSeedPath_ = appConfig_.sessionSeedPath;
+    if (calibrationReportPath_.empty()) {
+        if (!calibrationFilePath_.empty()) {
+            calibrationReportPath_ = calibrationFilePath_.parent_path() / "calibration_report.csv";
+        } else {
+            calibrationReportPath_ = std::filesystem::current_path() / "logs/calibration_report.csv";
+        }
+    }
 
     const double nowSeconds = ofGetElapsedTimef();
     sceneController_.setup(nowSeconds, 1.2);
@@ -79,20 +80,38 @@ void ofApp::setup() {
     controlPanel_.add(startButton_.setup("Start First Phase"));
     controlPanel_.add(endButton_.setup("Trigger End"));
     controlPanel_.add(resetButton_.setup("Reset to Idle"));
+    controlPanel_.add(envelopeCalibrationButton_.setup("Envelope Baseline 計測"));
 
     startButton_.addListener(this, &ofApp::onStartButtonPressed);
     endButton_.addListener(this, &ofApp::onEndButtonPressed);
     resetButton_.addListener(this, &ofApp::onResetButtonPressed);
+    envelopeCalibrationButton_.addListener(this, &ofApp::onEnvelopeCalibrationButtonPressed);
+
+    statusPanel_.setup("Monitor");
+    statusPanel_.setPosition(controlPanel_.getPosition().x,
+                             controlPanel_.getPosition().y + controlPanel_.getHeight() + 12.0f);
+    statusPanel_.add(sceneOverviewParam_.set("シーン状態", sceneToString(sceneController_.currentState())));
+    statusPanel_.add(timeInStateParam_.set("滞在時間", "0.0s"));
+    statusPanel_.add(transitionProgressParam_.set("遷移進行度", 0.0f, 0.0f, 1.0f));
+    statusPanel_.add(envelopeMonitorParam_.set("エンベロープ", 0.0f, 0.0f, 1.0f));
+    statusPanel_.add(hapticRateParam_.set("ハプティクス/分", 0.0f, 0.0f, 240.0f));
+    statusPanel_.add(calibrationStateParam_.set("キャリブレーション", makeCalibrationStatusText()));
+    statusPanel_.add(limiterReductionParam_.set("リミッタ(dB)", 0.0f, -40.0f, 0.0f));
+    statusPanel_.add(baselineEnvelopeParam_.set("包絡ベースライン", 0.0f, 0.0f, 2.0f));
+    statusPanel_.add(envelopeCalibrationProgressParam_.set("包絡キャリブ進捗", 0.0f, 0.0f, 1.0f));
+    statusPanel_.add(guidanceParam_.set("ガイダンス", "-"));
 
     sampleRate_ = 48000.0;
     bufferSize_ = 512;
     audioPipeline_.setup(sampleRate_, bufferSize_);
     audioPipeline_.loadCalibrationFile(calibrationFilePath_);
+    initializeSessionSeed();
     calibrationSaved_ = audioPipeline_.calibrationReady();
     calibrationSaveAttempted_ = calibrationSaved_;
+    calibrationReportAppended_ = false;
 
     if (!calibrationSaved_) {
-        ensureDirectory(calibrationFilePath_);
+        ensureParentDirectory(calibrationFilePath_);
         ofLogNotice("ofApp") << "Calibration file not ready. Starting calibration.";
         audioPipeline_.startCalibration();
     }
@@ -122,6 +141,8 @@ void ofApp::setup() {
     lastSimulatedBeatAt_ = 0.0;
     beatCounter_ = 0;
     limiterReductionDbSmooth_ = 0.0f;
+    lastStrongSignalAt_ = nowSeconds;
+    weakSignalWarning_ = false;
 
     const std::string defaultSceneLower = ofToLower(appConfig_.defaultScene);
     if (defaultSceneLower == "firstphase") {
@@ -141,9 +162,10 @@ void ofApp::update() {
     if (audioPipeline_.isCalibrationActive()) {
         calibrationSaved_ = false;
         calibrationSaveAttempted_ = false;
+        calibrationReportAppended_ = false;
     } else if (audioPipeline_.calibrationReady() && !calibrationSaved_) {
         if (!calibrationSaveAttempted_) {
-            ensureDirectory(calibrationFilePath_);
+            ensureParentDirectory(calibrationFilePath_);
             if (audioPipeline_.saveCalibrationFile(calibrationFilePath_)) {
                 calibrationSaved_ = true;
                 ofLogNotice("ofApp") << "Calibration saved to " << calibrationFilePath_;
@@ -153,6 +175,13 @@ void ofApp::update() {
             calibrationSaveAttempted_ = true;
         }
     }
+
+    if (calibrationSaved_ && !calibrationReportAppended_) {
+        appendCalibrationReport(audioPipeline_.calibrationResult(), lastEnvelopeCalibrationStats_);
+        calibrationReportAppended_ = true;
+    }
+
+    updateEnvelopeCalibrationUi(nowSeconds);
 
     const bool calibrationActive = audioPipeline_.isCalibrationActive();
     const bool useSynthetic = simulateTelemetry_ || !soundStreamActive_ || calibrationActive;
@@ -179,6 +208,8 @@ void ofApp::update() {
     }
 
     updateSceneGui(nowSeconds);
+    calibrationStateParam_.set(makeCalibrationStatusText());
+    limiterReductionParam_.set(limiterReductionDbSmooth_);
 
     const uint64_t intervalMicros =
         static_cast<uint64_t>(appConfig_.telemetry.writeIntervalMs) * 1000ULL;
@@ -204,6 +235,9 @@ void ofApp::draw() {
     const float blend = sceneController_.transitionBlend();
     drawScene(current, blend, nowSeconds);
     controlPanel_.draw();
+    statusPanel_.setPosition(controlPanel_.getPosition().x,
+                             controlPanel_.getPosition().y + controlPanel_.getHeight() + 12.0f);
+    statusPanel_.draw();
     drawCalibrationStatus();
     drawBeatDebug();
 }
@@ -212,6 +246,7 @@ void ofApp::exit() {
     startButton_.removeListener(this, &ofApp::onStartButtonPressed);
     endButton_.removeListener(this, &ofApp::onEndButtonPressed);
     resetButton_.removeListener(this, &ofApp::onResetButtonPressed);
+    envelopeCalibrationButton_.removeListener(this, &ofApp::onEnvelopeCalibrationButtonPressed);
 
     if (soundStreamActive_) {
         try {
@@ -282,6 +317,10 @@ void ofApp::audioOut(ofSoundBuffer& output) {
 }
 
 void ofApp::onStartButtonPressed() {
+    if (isInteractionLocked()) {
+        ofLogNotice("ofApp") << "Start request ignored (locked state).";
+        return;
+    }
     const double nowSeconds = ofGetElapsedTimef();
     if (!sceneController_.requestState(SceneState::FirstPhase, nowSeconds)) {
         ofLogNotice("ofApp") << "Start request ignored.";
@@ -289,6 +328,10 @@ void ofApp::onStartButtonPressed() {
 }
 
 void ofApp::onEndButtonPressed() {
+    if (isInteractionLocked()) {
+        ofLogNotice("ofApp") << "End request ignored (locked state).";
+        return;
+    }
     const double nowSeconds = ofGetElapsedTimef();
     if (!sceneController_.requestState(SceneState::End, nowSeconds)) {
         ofLogNotice("ofApp") << "End request ignored.";
@@ -296,9 +339,36 @@ void ofApp::onEndButtonPressed() {
 }
 
 void ofApp::onResetButtonPressed() {
+    if (isInteractionLocked()) {
+        ofLogNotice("ofApp") << "Reset request ignored (locked state).";
+        return;
+    }
     const double nowSeconds = ofGetElapsedTimef();
     if (!sceneController_.requestState(SceneState::Idle, nowSeconds)) {
         ofLogNotice("ofApp") << "Reset request ignored.";
+    }
+}
+
+void ofApp::onEnvelopeCalibrationButtonPressed() {
+    if (audioPipeline_.isCalibrationActive()) {
+        ofLogNotice("ofApp") << "Envelope calibration ignored (channel calibration running).";
+        return;
+    }
+    if (audioPipeline_.isEnvelopeCalibrationActive() || envelopeCalibrationRunning_) {
+        ofLogNotice("ofApp") << "Envelope calibration already in progress.";
+        return;
+    }
+    constexpr double kCalibrationDurationSec = 3.0;
+    if (!soundStreamActive_) {
+        ofLogWarning("ofApp") << "サウンドストリームが停止中です。実機入力で計測してください。";
+    }
+    audioPipeline_.startEnvelopeCalibration(kCalibrationDurationSec);
+    envelopeCalibrationRunning_ = true;
+    envelopeCalibrationProgressParam_.set(0.0f);
+    baselineEnvelopeParam_.set(0.0f);
+    ofLogNotice("ofApp") << "Starting envelope baseline measurement for " << kCalibrationDurationSec << "s";
+    if (simulateTelemetry_) {
+        ofLogWarning("ofApp") << "Synthetic signalが有効な状態で包絡キャリブを開始しました。実入力に切り替えることを推奨します。";
     }
 }
 
@@ -307,14 +377,16 @@ void ofApp::updateSceneGui(double nowSeconds) {
     const SceneState target = sceneController_.targetState();
     const bool transitioning = sceneController_.isTransitioning();
 
+    std::string sceneLabel;
     if (transitioning) {
         std::ostringstream oss;
         oss << sceneToString(current) << " → " << sceneToString(target);
         oss << " (" << static_cast<int>(sceneController_.transitionBlend() * 100.0f) << "%)";
-        sceneParam_.set(oss.str());
+        sceneLabel = oss.str();
     } else {
-        sceneParam_.set(sceneToString(current));
+        sceneLabel = sceneToString(current);
     }
+    sceneParam_.set(sceneLabel);
 
     bpmParam_.set(latestMetrics_.bpm);
     envelopeParam_.set(latestMetrics_.envelope);
@@ -323,6 +395,21 @@ void ofApp::updateSceneGui(double nowSeconds) {
     const double horizon = std::clamp(sceneController_.timeInState(nowSeconds) * 1.2, 10.0, 45.0);
     envelopeHistory_.setHorizon(horizon);
     envelopeHistory_.prune(nowSeconds);
+
+    sceneOverviewParam_.set(sceneLabel);
+    const double timeInStateSec = sceneController_.timeInState(nowSeconds);
+    timeInStateParam_.set(ofToString(timeInStateSec, 1) + "s");
+    transitionProgressParam_.set(transitioning ? sceneController_.transitionBlend() : 0.0f);
+    envelopeMonitorParam_.set(std::clamp(latestMetrics_.envelope, 0.0f, 1.0f));
+    hapticRateParam_.set(computeHapticRatePerMinute(nowSeconds));
+
+    if (latestMetrics_.envelope >= 0.18f) {
+        lastStrongSignalAt_ = nowSeconds;
+        weakSignalWarning_ = false;
+    } else if (nowSeconds - lastStrongSignalAt_ > 3.0) {
+        weakSignalWarning_ = true;
+    }
+    guidanceParam_.set(buildGuidanceMessage(nowSeconds));
 }
 
 void ofApp::updateEnvelopeHistory(double nowSeconds, float envelopeValue) {
@@ -383,6 +470,214 @@ void ofApp::appendHapticEvent(double nowSeconds, float intensity, const std::str
         frame.intensity = entry.intensity;
         hapticLogger_->append(frame);
     }
+}
+
+void ofApp::updateEnvelopeCalibrationUi(double /*nowSeconds*/) {
+    const bool active = audioPipeline_.isEnvelopeCalibrationActive();
+    envelopeCalibrationRunning_ = active;
+    if (active) {
+        envelopeCalibrationProgressParam_.set(audioPipeline_.envelopeCalibrationProgress());
+    } else {
+        envelopeCalibrationProgressParam_.set(0.0f);
+    }
+
+    knot::audio::EnvelopeCalibrationStats stats;
+    if (audioPipeline_.pollEnvelopeCalibrationStats(stats)) {
+        lastEnvelopeCalibrationStats_ = stats;
+        baselineEnvelopeParam_.set(std::clamp(stats.mean, 0.0f, 2.0f));
+        logEnvelopeCalibrationResult(stats);
+    } else if (lastEnvelopeCalibrationStats_) {
+        baselineEnvelopeParam_.set(std::clamp(lastEnvelopeCalibrationStats_->mean, 0.0f, 2.0f));
+    } else if (!active) {
+        baselineEnvelopeParam_.set(0.0f);
+    }
+}
+
+void ofApp::initializeSessionSeed() {
+    if (sessionSeedPath_.empty()) {
+        sessionSeed_ = 0;
+        return;
+    }
+
+    ensureParentDirectory(sessionSeedPath_);
+
+    if (std::filesystem::exists(sessionSeedPath_)) {
+        try {
+            const ofJson json = ofLoadJson(sessionSeedPath_.string());
+            if (json.contains("seed")) {
+                if (json["seed"].is_number_unsigned()) {
+                    sessionSeed_ = json["seed"].get<std::uint64_t>();
+                } else if (json["seed"].is_number_integer()) {
+                    sessionSeed_ = static_cast<std::uint64_t>(json["seed"].get<long long>());
+                }
+            }
+        } catch (const std::exception& ex) {
+            ofLogWarning("ofApp") << "Failed to load session seed: " << sessionSeedPath_ << " reason: " << ex.what();
+        }
+    }
+
+    if (sessionSeed_ == 0) {
+        std::random_device rd;
+        const std::uint64_t randomHigh = static_cast<std::uint64_t>(rd()) << 32;
+        const std::uint64_t tick = static_cast<std::uint64_t>(ofGetElapsedTimeMicros());
+        sessionSeed_ = randomHigh ^ tick;
+        if (sessionSeed_ == 0) {
+            sessionSeed_ = 1;  // ensure non-zero
+        }
+
+        ofJson json = {
+            {"seed", sessionSeed_},
+            {"createdUtc", ofGetTimestampString("%FT%TZ")},
+            {"note", "auto-generated for reproducibility"},
+        };
+
+        try {
+            ofSavePrettyJson(sessionSeedPath_.string(), json);
+        } catch (const std::exception& ex) {
+            ofLogWarning("ofApp") << "Failed to write session seed: " << sessionSeedPath_ << " reason: " << ex.what();
+        }
+    }
+
+    audioPipeline_.setNoiseSeed(static_cast<std::uint32_t>(sessionSeed_ & 0xffffffffu));
+}
+
+bool ofApp::ensureParentDirectory(const std::filesystem::path& path) {
+    const auto parent = path.parent_path();
+    if (parent.empty()) {
+        return true;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(parent, ec);
+    if (ec) {
+        ofLogWarning("ofApp") << "Failed to create directory " << parent << ": " << ec.message();
+        return false;
+    }
+    return true;
+}
+
+void ofApp::appendCalibrationReport(
+    const std::array<knot::audio::ChannelCalibrationValue, 2>& values,
+    const std::optional<knot::audio::EnvelopeCalibrationStats>& envelopeStats) {
+    if (calibrationReportPath_.empty()) {
+        return;
+    }
+
+    if (!ensureParentDirectory(calibrationReportPath_)) {
+        return;
+    }
+
+    bool needsHeader = true;
+    if (std::filesystem::exists(calibrationReportPath_)) {
+        std::error_code sizeError;
+        const auto fileSize = std::filesystem::file_size(calibrationReportPath_, sizeError);
+        needsHeader = sizeError ? true : (fileSize == 0);
+    }
+
+    std::ofstream stream(calibrationReportPath_, std::ios::app);
+    if (!stream.is_open()) {
+        ofLogWarning("ofApp") << "Failed to open calibration report: " << calibrationReportPath_;
+        return;
+    }
+
+    auto gainDb = [](float gain) -> double {
+        if (gain <= 0.0f) {
+            return -std::numeric_limits<double>::infinity();
+        }
+        return 20.0 * std::log10(static_cast<double>(gain));
+    };
+
+    const double gainDbCh1 = gainDb(values[0].gain);
+    const double gainDbCh2 = gainDb(values[1].gain);
+    const bool gainOkCh1 = std::isfinite(gainDbCh1) && std::abs(gainDbCh1) <= 3.0;
+    const bool gainOkCh2 = std::isfinite(gainDbCh2) && std::abs(gainDbCh2) <= 3.0;
+    const bool delayOkCh1 = std::abs(values[0].delaySamples) <= 2;
+    const bool delayOkCh2 = std::abs(values[1].delaySamples) <= 2;
+
+    auto okText = [](bool ok) { return ok ? "OK" : "NG"; };
+
+    if (needsHeader) {
+        stream << "timestampUtc,sessionSeed,sampleRateHz,"
+               << "gainCh1,gainDbCh1,gainSpecCh1,delaySamplesCh1,delaySpecCh1,phaseDegCh1,"
+               << "gainCh2,gainDbCh2,gainSpecCh2,delaySamplesCh2,delaySpecCh2,phaseDegCh2,"
+               << "envelopeMean,envelopePeak,envelopeRatio,envelopeSpec\n";
+    }
+
+    stream << std::fixed << std::setprecision(6);
+
+    const std::string timestamp = ofGetTimestampString("%FT%TZ");
+    stream << timestamp << ',' << sessionSeed_ << ',' << sampleRate_ << ','
+           << values[0].gain << ',' << gainDbCh1 << ',' << okText(gainOkCh1) << ','
+           << values[0].delaySamples << ',' << okText(delayOkCh1) << ',' << values[0].phaseDeg << ','
+           << values[1].gain << ',' << gainDbCh2 << ',' << okText(gainOkCh2) << ','
+           << values[1].delaySamples << ',' << okText(delayOkCh2) << ',' << values[1].phaseDeg << ',';
+
+    if (envelopeStats) {
+        const float mean = envelopeStats->mean;
+        const float peak = envelopeStats->peak;
+        const float ratio = (mean > 1e-6f) ? (peak / mean) : 0.0f;
+        const bool envOk = envelopeStats->valid && ratio >= 1.15f;
+        stream << mean << ',' << peak << ',' << ratio << ',' << okText(envOk) << '\n';
+        if (!envOk) {
+            ofLogWarning("ofApp") << "Envelope calibration below target ratio: " << ratio
+                                   << " (mean=" << mean << ", peak=" << peak << ")";
+        }
+    } else {
+        stream << "NA,NA,NA,NA\n";
+    }
+
+    if (!(gainOkCh1 && gainOkCh2 && delayOkCh1 && delayOkCh2)) {
+        ofLogWarning("ofApp") << "Calibration exceeds thresholds."
+                               << " gainDbCh1=" << gainDbCh1
+                               << " gainDbCh2=" << gainDbCh2
+                               << " delayCh1=" << values[0].delaySamples
+                               << " delayCh2=" << values[1].delaySamples;
+    }
+}
+
+void ofApp::logEnvelopeCalibrationResult(const knot::audio::EnvelopeCalibrationStats& stats) {
+    const float mean = stats.mean;
+    const float peak = stats.peak;
+    const float ratio = (mean > 1e-6f) ? (peak / mean) : 0.0f;
+    ofLogNotice("ofApp") << "Envelope calibration completed."
+                           << " mean=" << mean
+                           << " peak=" << peak
+                           << " ratio=" << ratio
+                           << " valid=" << (stats.valid ? "true" : "false");
+
+    if (stats.valid && ratio < 1.15f) {
+        ofLogWarning("ofApp") << "Envelope ratio below recommended threshold. Consider再測定 or gain調整.";
+    }
+
+    appendCalibrationReport(audioPipeline_.calibrationResult(), stats);
+}
+
+std::string ofApp::makeCalibrationStatusText() const {
+    std::ostringstream oss;
+    if (audioPipeline_.isCalibrationActive()) {
+        oss << "running";
+    } else if (audioPipeline_.calibrationReady()) {
+        oss << "ready";
+        if (!calibrationSaved_) {
+            oss << " (unsaved)";
+        }
+    } else {
+        oss << "idle";
+    }
+
+    if (!calibrationReportPath_.empty()) {
+        oss << " → " << calibrationReportPath_;
+    }
+    if (envelopeCalibrationRunning_) {
+        oss << " | env=calibrating";
+    } else if (lastEnvelopeCalibrationStats_) {
+        const float ratio = (lastEnvelopeCalibrationStats_->mean > 1e-6f)
+                                ? (lastEnvelopeCalibrationStats_->peak / lastEnvelopeCalibrationStats_->mean)
+                                : 0.0f;
+        oss << " | env=" << std::fixed << std::setprecision(3) << lastEnvelopeCalibrationStats_->mean
+            << " (ratio=" << ratio << ')';
+        oss << std::defaultfloat;
+    }
+    return oss.str();
 }
 
 void ofApp::drawScene(SceneState state, float alpha, double nowSeconds) {
@@ -563,25 +858,82 @@ void ofApp::drawEnvelopeGraph(const ofRectangle& area) const {
     ofPopStyle();
 }
 
+void ofApp::drawHapticChart(const ofRectangle& area, double nowSeconds) const {
+    ofPushStyle();
+    ofFill();
+    ofSetColor(24, 36, 58, 180);
+    ofDrawRectangle(area);
+    ofNoFill();
+    ofSetColor(120, 140, 180, 200);
+    ofDrawRectangle(area);
+
+    const double windowSec = 10.0;
+    const double startTime = nowSeconds - windowSec;
+
+    const float baselineY = area.getBottom();
+    ofSetColor(160, 170, 190, 160);
+    ofDrawBitmapString("0.0", area.x + 4.0f, baselineY - 4.0f);
+
+    const float thresholdIntensity = 0.30f;
+    const float thresholdY = ofMap(thresholdIntensity, 0.0f, 1.0f, area.getBottom(), area.getTop(), true);
+    ofSetColor(255, 120, 120, 140);
+    ofDrawLine(area.x, thresholdY, area.getRight(), thresholdY);
+    ofDrawBitmapString("推奨閾値 0.30", area.x + 4.0f, thresholdY - 4.0f);
+
+    ofPolyline poly;
+    poly.clear();
+
+    const auto& entries = hapticLog_.entries();
+    for (const auto& entry : entries) {
+        if (entry.createdAtSec < startTime) {
+            continue;
+        }
+        const double norm = std::clamp((entry.createdAtSec - startTime) / windowSec, 0.0, 1.0);
+        const float x = area.x + static_cast<float>(norm) * area.width;
+        const float y = ofMap(entry.intensity, 0.0f, 1.0f, area.getBottom(), area.getTop(), true);
+        poly.addVertex(x, y);
+    }
+
+    if (poly.size() >= 2) {
+        ofSetColor(255, 196, 120, 220);
+        poly.draw();
+    } else if (poly.size() == 1) {
+        ofSetColor(255, 196, 120, 220);
+        ofDrawCircle(poly.getVertices()[0], 3.0f);
+    } else {
+        ofSetColor(200, 210, 230, 180);
+        ofDrawBitmapString("最近10秒のイベントなし", area.x + 8.0f, area.y + 18.0f);
+    }
+
+    ofPopStyle();
+}
+
 void ofApp::drawHapticLog(const ofRectangle& area, double nowSeconds) const {
     ofPushStyle();
     ofNoFill();
     ofSetColor(255, 255, 255, 140);
     ofDrawRectangle(area);
 
+    ofSetColor(255, 230, 150);
+    ofDrawBitmapString("ハプティクスイベント可視化", area.x + 6.0f, area.y + 18.0f);
+
+    const float chartMargin = 8.0f;
+    const float chartHeight = std::max(70.0f, area.height * 0.45f);
+    ofRectangle chartArea(area.x + chartMargin, area.y + 26.0f,
+                          area.width - chartMargin * 2.0f, chartHeight);
+    drawHapticChart(chartArea, nowSeconds);
+
     const auto& entries = hapticLog_.entries();
+    const float listTop = chartArea.getBottom() + 24.0f;
+
     if (entries.empty()) {
         ofSetColor(220, 220, 220);
-        ofDrawBitmapString("ハプティクスイベントなし", area.x + 6.0f, area.y + 20.0f);
+        ofDrawBitmapString("ログなし (イベント未検出)", area.x + 6.0f, listTop);
         ofPopStyle();
         return;
     }
 
-    float y = area.y + 20.0f;
-    ofSetColor(255, 230, 150);
-    ofDrawBitmapString("ハプティクスイベント (最新順)", area.x + 6.0f, y);
-    y += 16.0f;
-
+    float y = listTop;
     std::size_t drawn = 0;
     for (auto it = entries.rbegin(); it != entries.rend() && y < area.getBottom() - 8.0f; ++it) {
         std::ostringstream oss;
@@ -596,6 +948,64 @@ void ofApp::drawHapticLog(const ofRectangle& area, double nowSeconds) const {
         ++drawn;
     }
     ofPopStyle();
+}
+
+bool ofApp::isInteractionLocked() const {
+    return audioPipeline_.isCalibrationActive() || audioPipeline_.isEnvelopeCalibrationActive() || envelopeCalibrationRunning_;
+}
+
+float ofApp::computeHapticRatePerMinute(double nowSeconds) const {
+    const double windowSec = 10.0;
+    if (windowSec <= 0.0) {
+        return 0.0f;
+    }
+    const double startTime = nowSeconds - windowSec;
+    const auto& entries = hapticLog_.entries();
+    int count = 0;
+    for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+        if (it->createdAtSec < startTime) {
+            break;
+        }
+        ++count;
+    }
+    if (count == 0) {
+        return 0.0f;
+    }
+    return static_cast<float>(count * (60.0 / windowSec));
+}
+
+std::string ofApp::buildGuidanceMessage(double /*nowSeconds*/) const {
+    if (!soundStreamActive_) {
+        return "音声入出力が停止中です。デバイス選択と接続を確認してください。";
+    }
+    if (audioPipeline_.isCalibrationActive()) {
+        return "キャリブレーション中です。測定完了までシーン操作は無効になります。";
+    }
+    if (envelopeCalibrationRunning_) {
+        return "包絡キャリブレーションを実行中です。周囲を静かにして 3 秒ほどお待ちください。";
+    }
+    if (lastEnvelopeCalibrationStats_ && !lastEnvelopeCalibrationStats_->valid) {
+        return "包絡ベースラインが取得できていません。再測定し、入力レベルを確認してください。";
+    }
+    if (lastEnvelopeCalibrationStats_ && lastEnvelopeCalibrationStats_->valid) {
+        const float mean = lastEnvelopeCalibrationStats_->mean;
+        const float ratio = (mean > 1e-6f)
+                                ? (lastEnvelopeCalibrationStats_->peak / mean)
+                                : 0.0f;
+        if (ratio < 1.15f) {
+            return "包絡比が低下しています。マイクゲインか胸ピースの固定を見直してください。";
+        }
+    }
+    if (weakSignalWarning_) {
+        return "心音信号が弱い可能性があります。マイク位置と胸ピース固定を確認してください。";
+    }
+    if (simulateTelemetry_) {
+        return "シミュレーション信号を再生中です。実入力を確認するには Synthetic Signal を OFF にしてください。";
+    }
+    if (hapticRateParam_.get() < 30.0f && latestMetrics_.bpm > 0.0f) {
+        return "ハプティクス出力が BPM に追従していません。BeatTimeline 設定とログを確認してください。";
+    }
+    return "正常稼働中です。KPI はステータスパネルを参照してください。";
 }
 
 void ofApp::drawCalibrationStatus() const {
@@ -615,14 +1025,50 @@ void ofApp::drawCalibrationStatus() const {
         lines.push_back({"オーディオ入出力: 停止中 (シミュレーション再生)", ofColor(255, 160, 160)});
     }
 
-    if (audioPipeline_.isCalibrationActive()) {
-        lines.push_back({"キャリブレーション: 実行中…", ofColor(255, 210, 120)});
-    } else if (!calibrationSaved_) {
-        lines.push_back({"キャリブレーション: 未保存 (" + calibrationFilePath_.filename().string() + ")",
-                         ofColor(255, 180, 120)});
+    const bool calibrationActive = audioPipeline_.isCalibrationActive();
+    const bool calibrationReady = audioPipeline_.calibrationReady();
+    const std::string calStatus = makeCalibrationStatusText();
+
+    if (calibrationActive) {
+        lines.push_back({"キャリブレーション: 実行中 — GUI 操作は完了までロックされます", ofColor(255, 210, 120)});
+    } else if (!calibrationReady || !calibrationSaved_) {
+        lines.push_back({"キャリブレーション: 未保存/要再測定 — " + calStatus, ofColor(255, 180, 120)});
     } else {
-        lines.push_back({"キャリブレーション: OK (" + calibrationFilePath_.filename().string() + ")",
-                         ofColor(160, 240, 160)});
+        lines.push_back({"キャリブレーション: OK — " + calStatus, ofColor(160, 240, 160)});
+    }
+
+    if (envelopeCalibrationRunning_) {
+        const float progress = envelopeCalibrationProgressParam_.get() * 100.0f;
+        std::ostringstream oss;
+        oss << "包絡ベースライン: 計測中 (" << std::fixed << std::setprecision(1) << progress << "%)";
+        oss << std::defaultfloat;
+        lines.push_back({oss.str(), ofColor(255, 210, 150)});
+    } else if (lastEnvelopeCalibrationStats_) {
+        const auto& stats = *lastEnvelopeCalibrationStats_;
+        const float ratio = (stats.mean > 1e-6f) ? (stats.peak / stats.mean) : 0.0f;
+        std::ostringstream oss;
+        oss << "包絡ベースライン: mean=" << std::fixed << std::setprecision(3) << stats.mean
+            << " peak=" << stats.peak << " ratio=" << ratio;
+        oss << std::defaultfloat;
+        lines.push_back({oss.str(), stats.valid && ratio >= 1.15f ? ofColor(160, 240, 160)
+                                                                  : ofColor(255, 200, 140)});
+    } else {
+        lines.push_back({"包絡ベースライン: 未測定 — Envelope Baseline 計測 を実行してください", ofColor(255, 200, 150)});
+    }
+
+    if (weakSignalWarning_) {
+        lines.push_back({"警告: 心音エンベロープが閾値を下回っています。マイク位置とゲインを点検してください。",
+                         ofColor(255, 200, 140)});
+    }
+
+    if (simulateTelemetry_) {
+        lines.push_back({"情報: シミュレーション信号が有効です。Synthetic Signal を OFF にすると実入力をモニタできます。",
+                         ofColor(200, 220, 255)});
+    }
+
+    const std::string guidance = guidanceParam_.get();
+    if (!guidance.empty() && guidance != "-") {
+        lines.push_back({"ガイダンス: " + guidance, ofColor(200, 220, 255)});
     }
 
     float yCursor = y;
@@ -640,7 +1086,8 @@ void ofApp::drawBeatDebug() const {
     std::ostringstream oss;
     oss << "Limiter減衰: " << std::fixed << std::setprecision(1) << limiterReductionDbSmooth_ << " dB"
         << " / BPM: " << std::setprecision(1) << latestMetrics_.bpm
-        << " / Envelope: " << std::setprecision(2) << latestMetrics_.envelope;
+        << " / Envelope: " << std::setprecision(2) << latestMetrics_.envelope
+        << " / Haptic/min: " << std::setprecision(1) << hapticRateParam_.get();
     ofSetColor(210, 210, 220);
     ofDrawBitmapString(oss.str(), margin, ofGetHeight() - margin);
     ofPopStyle();

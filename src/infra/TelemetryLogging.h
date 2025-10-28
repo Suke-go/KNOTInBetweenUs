@@ -33,6 +33,8 @@ struct TelemetryConfig {
 struct AppConfig {
 	TelemetryConfig telemetry;
 	std::filesystem::path calibrationPath;
+	std::filesystem::path calibrationReportCsvPath;
+	std::filesystem::path sessionSeedPath;
 	bool enableSyntheticTelemetry = false;
 	std::string defaultScene = "Idle";
 };

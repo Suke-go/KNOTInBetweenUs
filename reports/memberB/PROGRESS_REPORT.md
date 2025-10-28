@@ -11,23 +11,25 @@
 | 実装ID | 作業内容 | 成果物/コミット | 記録リンク |
 | --- | --- | --- | --- |
 | SCN-01 | SceneController 実装＋GUI ボタン連携 | WIP (未コミット) | src/SceneController.* |
-| HPT-01 | HapticLog + CSV 連携、校正ステータス表示 | WIP (未コミット) | src/ofApp.cpp, src/HapticLog.* |
+| HPT-01 | HapticLog + CSV 連携、校正ステータス表示＋チャート可視化 | WIP (未コミット) | src/ofApp.cpp, src/HapticLog.* |
 | DSP-02 | Envelope グラフ／BPM ラベル描画 | WIP (未コミット) | src/ofApp.cpp |
 
 ## 3. KPI / 検証結果
 - BPM 可視化: 表示レイテンシ ~50ms, 更新周期 50ms
 - シーン遷移: Idle→First 1.2s, First→End 1.2s
-- ハプティクス: イベント遅延 ~0ms (疑似トリガ), CSV ログ: `logs/haptic_events.csv` へ追記確認
+- ハプティクス: イベント遅延 ~0ms (疑似トリガ), CSV ログ: `logs/haptic_events.csv` へ追記確認, チャート表示窓 10s
 - UX フィードバック: GUI 右側に Envelope ライン＋ログ領域を配置し視線移動を最小化
 
 ## 4. 課題・改善案
 - 課題ID: HPT-UX-01 / BeatTimeline 実データ未接続。MemberA の出力仕様確定待ち。
 - 課題ID: GUI-01 / `simulateSignal` 強制 ON 状態のユーザ通知文言をさらに明示（ツールチップ）したい。
+- 課題ID: HPT-CHART-02 / チャートのスケール自動調整を追加し、異常値を赤ハイライト表示したい。
 - 改善アイデア: GUI パネルのレイアウトを多言語対応にする場合の幅調整ロジック追加。
 
 ## 5. 次に着手する実装
 - [ ] HPT-01: CSV ログ出力と session writer 連携
 - [ ] HPT-02: 実機ハプティクス制御クラスとログ同期テスト
+- [ ] HPT-CHART-03: リアル入力でイベント密度を重ねる縦棒グラフを追記
 - [ ] SCN-02: End→Idle 自動戻り＋サマリ表示モーダル追加
 
 ## 6. 添付資料

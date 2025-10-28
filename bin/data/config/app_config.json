@@ -7,6 +7,8 @@
     "flushIntervalMs": 1000
   },
   "calibrationPath": "../calibration/channel_separator.json",
+  "calibrationReportCsv": "../logs/calibration_report.csv",
+  "sessionSeed": "config/session_seed.json",
   "enableSyntheticTelemetry": false,
   "defaultScene": "Idle"
 }

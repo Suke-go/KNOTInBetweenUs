@@ -25,6 +25,14 @@ void AudioPipeline::setup(double sampleRate, std::size_t bufferSize) {
     outputScratch_.assign(bufferSize_ * 2, 0.0f);
     totalSamplesProcessed_ = 0.0;
     limiterReductionDb_ = 0.0f;
+    lastEnvelopeCalibration_ = {};
+    envelopeCalibrationActive_ = false;
+    newEnvelopeCalibrationAvailable_ = false;
+}
+
+void AudioPipeline::setNoiseSeed(std::uint32_t seed) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    rng_.seed(seed);
 }
 
 void AudioPipeline::ensureBufferSizes(std::size_t numFrames) {
@@ -64,6 +72,8 @@ void AudioPipeline::startCalibration() {
     metrics_ = {};
     pendingEvents_.clear();
     totalSamplesProcessed_ = 0.0;
+    envelopeCalibrationActive_ = false;
+    newEnvelopeCalibrationAvailable_ = false;
 }
 
 bool AudioPipeline::isCalibrationActive() const {
@@ -79,6 +89,38 @@ void AudioPipeline::applyCalibration(float& ch1, float& ch2) const {
     ch2 *= calibrationValues_[1].gain;
 }
 
+void AudioPipeline::startEnvelopeCalibration(double durationSec) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    beatTimeline_.beginEnvelopeCalibration(durationSec);
+    envelopeCalibrationActive_ = beatTimeline_.isEnvelopeCalibrating();
+    newEnvelopeCalibrationAvailable_ = false;
+}
+
+bool AudioPipeline::isEnvelopeCalibrationActive() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return envelopeCalibrationActive_;
+}
+
+float AudioPipeline::envelopeCalibrationProgress() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return beatTimeline_.calibrationProgress();
+}
+
+BeatTimeline::EnvelopeCalibrationStats AudioPipeline::lastEnvelopeCalibration() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return lastEnvelopeCalibration_;
+}
+
+bool AudioPipeline::pollEnvelopeCalibrationStats(BeatTimeline::EnvelopeCalibrationStats& stats) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!newEnvelopeCalibrationAvailable_) {
+        return false;
+    }
+    stats = lastEnvelopeCalibration_;
+    newEnvelopeCalibrationAvailable_ = false;
+    return true;
+}
+
 void AudioPipeline::audioIn(const ofSoundBuffer& buffer) {
     const auto numFrames = static_cast<std::size_t>(buffer.getNumFrames());
     if (buffer.getNumChannels() < 2 || numFrames == 0) {
@@ -92,6 +134,7 @@ void AudioPipeline::audioIn(const ofSoundBuffer& buffer) {
     if (calibrationArmed_) {
         calibrationSession_.capture(input, numFrames);
     } else {
+        const bool wasEnvelopeCalibrating = beatTimeline_.isEnvelopeCalibrating();
         for (std::size_t frame = 0; frame < numFrames; ++frame) {
             float ch1 = input[frame * 2];
             float ch2 = input[frame * 2 + 1];
@@ -113,6 +156,14 @@ void AudioPipeline::audioIn(const ofSoundBuffer& buffer) {
                     pendingEvents_.pop_front();
                 }
             }
+        }
+        const bool isEnvelopeCalibrating = beatTimeline_.isEnvelopeCalibrating();
+        if (wasEnvelopeCalibrating && !isEnvelopeCalibrating) {
+            lastEnvelopeCalibration_ = beatTimeline_.calibrationStats();
+            envelopeCalibrationActive_ = false;
+            newEnvelopeCalibrationAvailable_ = true;
+        } else {
+            envelopeCalibrationActive_ = isEnvelopeCalibrating;
         }
     }
 }

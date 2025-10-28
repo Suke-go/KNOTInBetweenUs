@@ -92,6 +92,9 @@ AppConfig AppConfigLoader::load(const std::filesystem::path& configRelativePath)
 	config.telemetry.flushIntervalMs = telemetryJson.value("flushIntervalMs", 1000);
 
 	config.calibrationPath = makeAbsolute(std::filesystem::path(json.value("calibrationPath", "../calibration/channel_separator.json")));
+	config.calibrationReportCsvPath =
+		makeAbsolute(std::filesystem::path(json.value("calibrationReportCsv", "../logs/calibration_report.csv")));
+	config.sessionSeedPath = makeAbsolute(std::filesystem::path(json.value("sessionSeed", "config/session_seed.json")));
 	config.enableSyntheticTelemetry = json.value("enableSyntheticTelemetry", false);
 	config.defaultScene = json.value("defaultScene", "Idle");
 	return config;
@@ -114,19 +117,21 @@ ofJson AppConfigLoader::loadOrCreateDefault(const std::filesystem::path& absolut
 
 ofJson AppConfigLoader::makeDefaultConfig(const std::filesystem::path& absolutePath) {
 	ofLogWarning("AppConfigLoader") << "Creating default config at " << absolutePath;
-	return ofJson{
-		{"telemetry",
-		 {
-			 {"sessionCsv", "../logs/proto_session.csv"},
-			 {"summaryJson", "../logs/proto_summary.json"},
-			 {"hapticCsv", "../logs/haptic_events.csv"},
-			 {"writeIntervalMs", 250},
-			 {"flushIntervalMs", 1000},
-		 }},
-		{"calibrationPath", "../calibration/channel_separator.json"},
-		{"enableSyntheticTelemetry", false},
-		{"defaultScene", "Idle"},
-	};
+		return ofJson{
+			{"telemetry",
+			 {
+				 {"sessionCsv", "../logs/proto_session.csv"},
+				 {"summaryJson", "../logs/proto_summary.json"},
+				 {"hapticCsv", "../logs/haptic_events.csv"},
+				 {"writeIntervalMs", 250},
+				 {"flushIntervalMs", 1000},
+			 }},
+			{"calibrationPath", "../calibration/channel_separator.json"},
+			{"calibrationReportCsv", "../logs/calibration_report.csv"},
+			{"sessionSeed", "config/session_seed.json"},
+			{"enableSyntheticTelemetry", false},
+			{"defaultScene", "Idle"},
+		};
 }
 
 void SummaryAggregator::reset() {
