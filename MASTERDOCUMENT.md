@@ -28,6 +28,20 @@ This is the visualization/sonification system of people's heartbeat.
 - 視覚・触覚・聴覚を統合した演出によって、没入を支える体験環境を提供する。
 - 心音が生成するリアクティブビジュアルの鑑賞を通じ、参加者同士の関係性や体験の余韻を深める。
 
+## Signal Processing Algorithm
+- Normalization
+- add lowpass/highpass
+    - 20hz-150hz
+    - ofxMaxim
+        - maxiFilter
+- plus gain +15db
+- 半波整流
+- Envelope Detection
+    - フィルタを通った波形（filteredSample）のマイナス成分を0にクリップします。
+    - 整流したギザギザのサンプルを、ゆっくりと変化するエンベロープ（包絡線）にします(maxiEnv)。
+- Round Quantise
+- Rising Edge Detection
+
 ## UX
 - 開始準備
     - Init Scene(最初だけ)
@@ -38,6 +52,9 @@ This is the visualization/sonification system of people's heartbeat.
             - Bass Speaker 2
         - Init microphone
             - visualize signals
+            - separate channels(these are recognized single microphone but it has 2 channels)
+                - microphone 1
+                - microphone 2
     - Idle状態
         - 常時マイクからの入力をripplesとして表現する(心音のチェック)
             - ripplesはcountheartrateクラスによってcountedされた心音のピーク
@@ -54,12 +71,17 @@ This is the visualization/sonification system of people's heartbeat.
             - 背景の中に星空のように白色のglowしている点を描画する
         - 日本語のフォントはNoto Sans JP Thinで単色白色
     - play bell.wav
-    - Start First Phase: 自分の心音を他感覚的に近くする（1min）
+    - Start First Phase: 自分の心音を多感覚的に近くする（1min）
         - 各自に自身の心音を再生
+            - それぞれ
             - 100Hzでローパスされた心音リズムに同期した振動で調和を促進
         - 背景は黒色
             - 背景の中に星空のように白色のglowしている点を描画する
             - 全体の面積を中心線（x軸｜縦軸）で区切ってその中にプロットされている星空のパルスがcountheartrateによってcountされるたびにglowする感じ
+    - Exchange Heart Beat Phase：二人の参加者の心音を交換する
+        
+        - audio localizationを行う
+            - 
 
 
 
