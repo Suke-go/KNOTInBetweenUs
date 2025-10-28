@@ -97,6 +97,20 @@ AppConfig AppConfigLoader::load(const std::filesystem::path& configRelativePath)
 	config.sessionSeedPath = makeAbsolute(std::filesystem::path(json.value("sessionSeed", "config/session_seed.json")));
 	config.enableSyntheticTelemetry = json.value("enableSyntheticTelemetry", false);
 	config.defaultScene = json.value("defaultScene", "Idle");
+	config.operationMode = json.value("operationMode", "debug");
+	config.inputGainDb = json.value("inputGainDb", 0.0f);
+
+	const auto guiJson = json.value("gui", ofJson::object());
+	config.gui.showControlPanel = guiJson.value("showControlPanel", true);
+	config.gui.showStatusPanel = guiJson.value("showStatusPanel", true);
+	config.gui.allowKeyboardToggle = guiJson.value("allowKeyboardToggle", true);
+	config.gui.keyboardToggleKey = guiJson.value("keyboardToggleKey", "g");
+	config.gui.keyboardToggleHoldTime = guiJson.value("keyboardToggleHoldTime", 0.0);
+	config.gui.allowCornerUnlock = guiJson.value("allowCornerUnlock", false);
+
+	config.sceneTimingConfigPath = std::filesystem::path(json.value("sceneTimingConfig", "config/scene_timing.json"));
+	config.sceneTransitionCsvPath =
+		makeAbsolute(std::filesystem::path(json.value("sceneTransitionCsv", "../logs/scene_transitions.csv")));
 	return config;
 }
 
@@ -131,6 +145,19 @@ ofJson AppConfigLoader::makeDefaultConfig(const std::filesystem::path& absoluteP
 			{"sessionSeed", "config/session_seed.json"},
 			{"enableSyntheticTelemetry", false},
 			{"defaultScene", "Idle"},
+			{"operationMode", "debug"},
+			{"inputGainDb", 0.0},
+			{"gui",
+			 {
+				 {"showControlPanel", true},
+				 {"showStatusPanel", true},
+				 {"allowKeyboardToggle", true},
+				 {"keyboardToggleKey", "g"},
+				 {"keyboardToggleHoldTime", 0.0},
+				 {"allowCornerUnlock", false},
+			 }},
+			{"sceneTimingConfig", "config/scene_timing.json"},
+			{"sceneTransitionCsv", "../logs/scene_transitions.csv"},
 		};
 }
 

@@ -10,5 +10,6 @@
   "calibrationReportCsv": "../logs/calibration_report.csv",
   "sessionSeed": "config/session_seed.json",
   "enableSyntheticTelemetry": false,
-  "defaultScene": "Idle"
+  "defaultScene": "Idle",
+  "inputGainDb": 20.0
 }

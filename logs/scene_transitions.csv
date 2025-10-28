@@ -1,0 +1,11 @@
+timestampMicros,sceneFrom,sceneTo,transitionType,triggerReason,timeInStateSec,expectedDurationSec,deviationSec,blendDurationSec,completed
+56131748,Idle,Start,manual,button_press,54.865,null,null,1.200,0
+57348386,Idle,Start,manual,button_press,1.217,null,null,1.200,1
+132615814,Idle,Start,manual,button_press,132.199,null,null,1.200,0
+133816032,Idle,Start,manual,button_press,1.200,null,null,1.200,1
+15183369,Idle,Start,manual,button_press,14.947,null,null,1.200,0
+16400406,Idle,Start,manual,button_press,1.217,null,null,1.200,1
+21133178,Idle,Start,manual,button_press,20.164,null,null,1.200,0
+22349733,Idle,Start,manual,button_press,1.217,null,null,1.200,1
+43182212,Idle,Start,manual,button_press,42.945,null,null,1.200,0
+44398865,Idle,Start,manual,button_press,1.217,null,null,1.200,1

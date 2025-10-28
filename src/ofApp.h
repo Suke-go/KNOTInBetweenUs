@@ -6,7 +6,9 @@
 #include "BeatVisualizer.h"
 #include "HapticLog.h"
 #include "SceneController.h"
+#include "SceneTimingConfig.h"
 #include "audio/AudioPipeline.h"
+#include "infra/SceneTransitionLogger.h"
 #include "infra/TelemetryLogging.h"
 
 #include <array>
@@ -59,7 +61,10 @@ private:
     // Drawing helpers
     void drawScene(SceneState state, float alpha, double nowSeconds);
     void drawIdleScene(float alpha, double nowSeconds);
+    void drawStartScene(float alpha, double nowSeconds);
     void drawFirstPhaseScene(float alpha, double nowSeconds);
+    void drawExchangeScene(float alpha, double nowSeconds);
+    void drawMixedScene(float alpha, double nowSeconds);
     void drawEndScene(float alpha);
     void drawEnvelopeGraph(const ofRectangle& area) const;
     void drawHapticLog(const ofRectangle& area, double nowSeconds) const;
@@ -73,12 +78,26 @@ private:
     std::string buildGuidanceMessage(double nowSeconds) const;
     float computeHapticRatePerMinute(double nowSeconds) const;
     void logEnvelopeCalibrationResult(const knot::audio::EnvelopeCalibrationStats& stats);
+    void processSceneTransitionEvents();
+    void handleTransitionEvent(const SceneController::TransitionEvent& event);
+    bool shouldDrawControlPanel() const;
+    bool shouldDrawStatusPanel() const;
+    void updateCornerUnlock(double nowSeconds, int x, int y);
+    void loadShaders();
+    void drawStarfieldLayer(float alpha, double nowSeconds, float envelope);
+    void drawRippleLayer(float alpha, double nowSeconds, float envelope);
+    float blendedEnvelope() const;
 
     // UI + state
     SceneController sceneController_;
     HapticLog hapticLog_{128};
     BeatEnvelopeHistory envelopeHistory_;
     BeatVisualMetrics latestMetrics_;
+    knot::audio::AudioPipeline::SignalHealth signalHealth_{};
+    bool lastFallbackActive_ = false;
+    float displayEnvelope_ = 0.0f;
+    std::shared_ptr<SceneTimingConfig> sceneTimingConfig_;
+    infra::SceneTransitionLogger sceneTransitionLogger_;
 
     ofxPanel controlPanel_;
     ofParameter<std::string> sceneParam_;
@@ -101,6 +120,9 @@ private:
     ofParameter<std::string> guidanceParam_;
     ofParameter<float> baselineEnvelopeParam_;
     ofParameter<float> envelopeCalibrationProgressParam_;
+
+    ofTrueTypeFont displayFont_;
+    ofTrueTypeFont guideFont_;
 
     double lastEnvelopeSampledAt_ = 0.0;
     double lastSimulatedBeatAt_ = 0.0;
@@ -130,4 +152,21 @@ private:
     float limiterReductionDbSmooth_ = 0.0f;
     double lastStrongSignalAt_ = 0.0;
     bool weakSignalWarning_ = false;
+    std::string operationMode_;
+    bool showControlPanel_ = true;
+    bool showStatusPanel_ = true;
+    bool guiOverrideVisible_ = false;
+    bool allowKeyboardToggle_ = true;
+    double guiToggleHoldTimeSec_ = 0.0;
+    int guiToggleKey_ = 'g';
+    double guiKeyPressedAtSec_ = 0.0;
+    bool allowCornerUnlock_ = false;
+    std::vector<std::pair<double, glm::vec2>> cornerTouches_;
+    double cornerUnlockWindowSec_ = 5.0;
+    ofShader starfieldShader_;
+    ofShader torusShader_;
+    ofShader rippleShader_;
+    bool starfieldShaderLoaded_ = false;
+    bool torusShaderLoaded_ = false;
+    bool rippleShaderLoaded_ = false;
 };

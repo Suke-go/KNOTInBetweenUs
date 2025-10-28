@@ -30,6 +30,15 @@ struct TelemetryConfig {
 	uint32_t flushIntervalMs = 1000;
 };
 
+struct GuiConfig {
+	bool showControlPanel = true;
+	bool showStatusPanel = true;
+	bool allowKeyboardToggle = true;
+	std::string keyboardToggleKey = "g";
+	double keyboardToggleHoldTime = 0.0;
+	bool allowCornerUnlock = false;
+};
+
 struct AppConfig {
 	TelemetryConfig telemetry;
 	std::filesystem::path calibrationPath;
@@ -37,6 +46,11 @@ struct AppConfig {
 	std::filesystem::path sessionSeedPath;
 	bool enableSyntheticTelemetry = false;
 	std::string defaultScene = "Idle";
+	std::string operationMode = "debug";
+	float inputGainDb = 0.0f;
+	GuiConfig gui;
+	std::filesystem::path sceneTimingConfigPath;
+	std::filesystem::path sceneTransitionCsvPath;
 };
 
 class AppConfigLoader {

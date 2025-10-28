@@ -1,0 +1,60 @@
+{
+  "version": "1.0",
+  "description": "Scene duration and transition conditions",
+  "scenes": {
+    "Idle": {
+      "autoDuration": null,
+      "comment": "Manual transition only. No auto-advance."
+    },
+    "Start": {
+      "autoDuration": 30.0,
+      "stages": [
+        { "name": "textFadeIn", "startAt": 0.0, "duration": 1.0 },
+        { "name": "textDisplay", "startAt": 1.0, "duration": 9.0 },
+        { "name": "textFadeOut", "startAt": 8.0, "duration": 2.0 },
+        { "name": "breathingGuide", "startAt": 12.0, "duration": 8.0 },
+        { "name": "bellSound", "startAt": 25.0, "duration": 2.0 }
+      ],
+      "transitionTo": "FirstPhase"
+    },
+    "FirstPhase": {
+      "autoDuration": 60.0,
+      "transitionCondition": {
+        "type": "timeout",
+        "comment": "Advance to Exchange after 60s"
+      },
+      "transitionTo": "Exchange"
+    },
+    "Exchange": {
+      "autoDuration": 60.0,
+      "transitionCondition": {
+        "type": "timeout",
+        "comment": "Advance to Mixed after 60s"
+      },
+      "transitionTo": "Mixed"
+    },
+    "Mixed": {
+      "autoDuration": 90.0,
+      "transitionCondition": {
+        "type": "timeout",
+        "comment": "Advance to End after 90s"
+      },
+      "transitionTo": "End"
+    },
+    "End": {
+      "autoDuration": 20.0,
+      "stages": [
+        { "name": "fadeOut", "startAt": 0.0, "duration": 10.0 },
+        { "name": "ambient", "startAt": 10.0, "duration": 5.0 },
+        { "name": "silence", "startAt": 15.0, "duration": 5.0 }
+      ],
+      "transitionTo": "Idle",
+      "idleReturnDelay": 15.0
+    }
+  },
+  "testMode": {
+    "enabled": false,
+    "comment": "When enabled, all autoDuration values are divided by 6 (e.g., 60s → 10s)",
+    "scaleFactor": 0.1667
+  }
+}

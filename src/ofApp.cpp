@@ -1,6 +1,7 @@
 #include "ofApp.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -10,11 +11,13 @@
 #include <random>
 #include <sstream>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include <glm/gtc/constants.hpp>
 #include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
+#include <glm/geometric.hpp>
 
 namespace {
 
@@ -29,16 +32,16 @@ float safeLerp(float a, float b, float t) {
     return a + (b - a) * std::clamp(t, 0.0f, 1.0f);
 }
 
-std::string sceneToString(SceneState state) {
-    switch (state) {
-        case SceneState::Idle:
-            return "Idle";
-        case SceneState::FirstPhase:
-            return "FirstPhase";
-        case SceneState::End:
-            return "End";
+ofMesh& fullscreenQuadMesh() {
+    static ofMesh mesh;
+    if (mesh.getNumVertices() == 0) {
+        mesh.setMode(OF_PRIMITIVE_TRIANGLE_STRIP);
+        mesh.addVertex(glm::vec3(-1.0f, -1.0f, 0.0f));
+        mesh.addVertex(glm::vec3(1.0f, -1.0f, 0.0f));
+        mesh.addVertex(glm::vec3(-1.0f, 1.0f, 0.0f));
+        mesh.addVertex(glm::vec3(1.0f, 1.0f, 0.0f));
     }
-    return "Unknown";
+    return mesh;
 }
 
 }  // namespace
@@ -49,6 +52,40 @@ void ofApp::setup() {
 
     infra::AppConfigLoader loader;
     appConfig_ = loader.load("config/app_config.json");
+    operationMode_ = ofToLower(appConfig_.operationMode);
+    showControlPanel_ = appConfig_.gui.showControlPanel;
+    showStatusPanel_ = appConfig_.gui.showStatusPanel;
+    allowKeyboardToggle_ = appConfig_.gui.allowKeyboardToggle;
+    allowCornerUnlock_ = appConfig_.gui.allowCornerUnlock;
+    guiToggleHoldTimeSec_ = std::max(0.0, appConfig_.gui.keyboardToggleHoldTime);
+    if (!appConfig_.gui.keyboardToggleKey.empty()) {
+        guiToggleKey_ = static_cast<int>(appConfig_.gui.keyboardToggleKey.front());
+    }
+
+    if (operationMode_ == "exhibition") {
+        showControlPanel_ = false;
+        showStatusPanel_ = false;
+        allowKeyboardToggle_ = false;
+    } else if (operationMode_ == "operator") {
+        showControlPanel_ = false;
+        showStatusPanel_ = true;
+    }
+
+    sceneTransitionLogger_.setup(appConfig_.sceneTransitionCsvPath);
+
+    bool displayLoaded = displayFont_.load("fonts/NotoSansJP-Thin.otf", 120, true, true, true);
+    if (!displayLoaded) {
+        ofLogWarning("ofApp") << "Failed to load fonts/NotoSansJP-Thin.otf. Falling back to system font.";
+        displayFont_.load(OF_TTF_SANS, 120, true, true, true);
+    }
+    bool guideLoaded = guideFont_.load("fonts/NotoSansJP-Regular.otf", 48, true, true, true);
+    if (!guideLoaded) {
+        ofLogWarning("ofApp") << "Failed to load fonts/NotoSansJP-Regular.otf. Falling back to system font.";
+        guideFont_.load(OF_TTF_SANS, 48, true, true, true);
+    }
+
+    auto timingConfig = SceneTimingConfig::load(appConfig_.sceneTimingConfigPath);
+    sceneTimingConfig_ = std::make_shared<SceneTimingConfig>(std::move(timingConfig));
 
     sessionLogger_ = std::make_unique<infra::SessionLogger>(appConfig_.telemetry, false);
     hapticLogger_ = std::make_unique<infra::HapticEventLogger>(appConfig_.telemetry.hapticCsvPath);
@@ -65,19 +102,20 @@ void ofApp::setup() {
     }
 
     const double nowSeconds = ofGetElapsedTimef();
+    sceneController_.setTimingConfig(sceneTimingConfig_);
     sceneController_.setup(nowSeconds, 1.2);
     envelopeHistory_.setHorizon(30.0);
     latestMetrics_ = {};
 
     controlPanel_.setup("Session Control");
     controlPanel_.setPosition(20.0f, 20.0f);
-    controlPanel_.add(sceneParam_.set("Scene", sceneToString(SceneState::Idle)));
+    controlPanel_.add(sceneParam_.set("Scene", sceneStateToString(SceneState::Idle)));
     controlPanel_.add(bpmParam_.set("BPM", 0.0f, 0.0f, 240.0f));
     controlPanel_.add(envelopeParam_.set("Envelope", 0.0f, 0.0f, 1.0f));
     controlPanel_.add(hapticCountParam_.set("Haptic Count", 0U, 0U, 4096U));
     simulateTelemetry_ = appConfig_.enableSyntheticTelemetry;
     controlPanel_.add(simulateSignalParam_.set("Synthetic Signal", simulateTelemetry_));
-    controlPanel_.add(startButton_.setup("Start First Phase"));
+    controlPanel_.add(startButton_.setup("Start Sequence"));
     controlPanel_.add(endButton_.setup("Trigger End"));
     controlPanel_.add(resetButton_.setup("Reset to Idle"));
     controlPanel_.add(envelopeCalibrationButton_.setup("Envelope Baseline 計測"));
@@ -90,7 +128,7 @@ void ofApp::setup() {
     statusPanel_.setup("Monitor");
     statusPanel_.setPosition(controlPanel_.getPosition().x,
                              controlPanel_.getPosition().y + controlPanel_.getHeight() + 12.0f);
-    statusPanel_.add(sceneOverviewParam_.set("シーン状態", sceneToString(sceneController_.currentState())));
+    statusPanel_.add(sceneOverviewParam_.set("シーン状態", sceneStateToString(sceneController_.currentState())));
     statusPanel_.add(timeInStateParam_.set("滞在時間", "0.0s"));
     statusPanel_.add(transitionProgressParam_.set("遷移進行度", 0.0f, 0.0f, 1.0f));
     statusPanel_.add(envelopeMonitorParam_.set("エンベロープ", 0.0f, 0.0f, 1.0f));
@@ -105,16 +143,14 @@ void ofApp::setup() {
     bufferSize_ = 512;
     audioPipeline_.setup(sampleRate_, bufferSize_);
     audioPipeline_.loadCalibrationFile(calibrationFilePath_);
+    audioPipeline_.setInputGainDb(appConfig_.inputGainDb);
+    ofLogNotice("ofApp") << "Input gain set to " << appConfig_.inputGainDb << " dB";
+    loadShaders();
     initializeSessionSeed();
     calibrationSaved_ = audioPipeline_.calibrationReady();
     calibrationSaveAttempted_ = calibrationSaved_;
     calibrationReportAppended_ = false;
-
-    if (!calibrationSaved_) {
-        ensureParentDirectory(calibrationFilePath_);
-        ofLogNotice("ofApp") << "Calibration file not ready. Starting calibration.";
-        audioPipeline_.startCalibration();
-    }
+    const bool pendingAutoCalibration = !calibrationSaved_;
 
     ofSoundStreamSettings settings;
     settings.sampleRate = static_cast<unsigned int>(sampleRate_);
@@ -135,6 +171,20 @@ void ofApp::setup() {
         simulateTelemetry_ = true;
     }
 
+    if (pendingAutoCalibration) {
+        if (soundStreamActive_) {
+            ensureParentDirectory(calibrationFilePath_);
+            ofLogNotice("ofApp") << "Calibration file not ready. Starting calibration.";
+            audioPipeline_.startCalibration();
+        } else {
+            ofLogWarning("ofApp")
+                << "Skip auto calibration because sound stream is inactive. Proceeding with degraded settings.";
+            calibrationSaved_ = true;
+            calibrationSaveAttempted_ = true;
+            calibrationReportAppended_ = true;
+        }
+    }
+
     sessionStartMicros_ = ofGetElapsedTimeMicros();
     lastTelemetryMicros_ = sessionStartMicros_;
     lastEnvelopeSampledAt_ = 0.0;
@@ -144,11 +194,10 @@ void ofApp::setup() {
     lastStrongSignalAt_ = nowSeconds;
     weakSignalWarning_ = false;
 
-    const std::string defaultSceneLower = ofToLower(appConfig_.defaultScene);
-    if (defaultSceneLower == "firstphase") {
-        sceneController_.requestState(SceneState::FirstPhase, nowSeconds);
-    } else if (defaultSceneLower == "end") {
-        sceneController_.requestState(SceneState::End, nowSeconds);
+    if (const auto defaultScene = sceneStateFromString(appConfig_.defaultScene)) {
+        if (*defaultScene != SceneState::Idle) {
+            sceneController_.requestState(*defaultScene, nowSeconds, false, "config_default");
+        }
     }
 }
 
@@ -157,6 +206,7 @@ void ofApp::update() {
     const double nowSeconds = static_cast<double>(nowMicros) * 1e-6;
 
     sceneController_.update(nowSeconds);
+    processSceneTransitionEvents();
     simulateTelemetry_ = simulateSignalParam_.get();
 
     if (audioPipeline_.isCalibrationActive()) {
@@ -166,12 +216,14 @@ void ofApp::update() {
     } else if (audioPipeline_.calibrationReady() && !calibrationSaved_) {
         if (!calibrationSaveAttempted_) {
             ensureParentDirectory(calibrationFilePath_);
-            if (audioPipeline_.saveCalibrationFile(calibrationFilePath_)) {
-                calibrationSaved_ = true;
+            const bool saved = audioPipeline_.saveCalibrationFile(calibrationFilePath_);
+            if (saved) {
                 ofLogNotice("ofApp") << "Calibration saved to " << calibrationFilePath_;
             } else {
-                ofLogWarning("ofApp") << "Failed to save calibration to " << calibrationFilePath_;
+                ofLogWarning("ofApp") << "Failed to save calibration to " << calibrationFilePath_
+                                      << ". Continuing with current calibration values.";
             }
+            calibrationSaved_ = true;
             calibrationSaveAttempted_ = true;
         }
     }
@@ -205,6 +257,23 @@ void ofApp::update() {
             updateFakeSignal(nowSeconds);
             limiterReductionDbSmooth_ = ofLerp(limiterReductionDbSmooth_, 0.0f, 0.15f);
         }
+        signalHealth_ = audioPipeline_.signalHealth();
+    }
+
+    if (!signalHealth_.fallbackActive && useSynthetic) {
+        signalHealth_.fallbackBlend = 0.0f;
+    }
+    displayEnvelope_ = blendedEnvelope();
+    latestMetrics_.envelope = displayEnvelope_;
+    updateEnvelopeHistory(nowSeconds, displayEnvelope_);
+
+    if (lastFallbackActive_ != signalHealth_.fallbackActive) {
+        if (signalHealth_.fallbackActive) {
+            ofLogNotice("ofApp") << "Signal dropout detected. Entering fallback mode.";
+        } else {
+            ofLogNotice("ofApp") << "Signal recovered. Returning to live input.";
+        }
+        lastFallbackActive_ = signalHealth_.fallbackActive;
     }
 
     updateSceneGui(nowSeconds);
@@ -218,7 +287,7 @@ void ofApp::update() {
         frame.timestampMicros = nowMicros;
         frame.bpm = latestMetrics_.bpm;
         frame.envelopePeak = latestMetrics_.envelope;
-        frame.sceneId = sceneParam_.get();
+        frame.sceneId = sceneStateToString(sceneController_.currentState());
         sessionLogger_->append(frame);
         lastTelemetryMicros_ = nowMicros;
     }
@@ -233,13 +302,24 @@ void ofApp::draw() {
     const double nowSeconds = ofGetElapsedTimef();
     const SceneState current = sceneController_.currentState();
     const float blend = sceneController_.transitionBlend();
-    drawScene(current, blend, nowSeconds);
-    controlPanel_.draw();
-    statusPanel_.setPosition(controlPanel_.getPosition().x,
-                             controlPanel_.getPosition().y + controlPanel_.getHeight() + 12.0f);
-    statusPanel_.draw();
-    drawCalibrationStatus();
-    drawBeatDebug();
+    const float baseAlpha = sceneController_.isTransitioning() ? blend : 1.0f;
+    drawScene(current, baseAlpha, nowSeconds);
+    if (shouldDrawControlPanel()) {
+        controlPanel_.draw();
+    }
+    if (shouldDrawStatusPanel()) {
+        if (shouldDrawControlPanel()) {
+            statusPanel_.setPosition(controlPanel_.getPosition().x,
+                                     controlPanel_.getPosition().y + controlPanel_.getHeight() + 12.0f);
+        } else {
+            statusPanel_.setPosition(20.0f, 20.0f);
+        }
+        statusPanel_.draw();
+    }
+    if (shouldDrawControlPanel() || shouldDrawStatusPanel()) {
+        drawCalibrationStatus();
+        drawBeatDebug();
+    }
 }
 
 void ofApp::exit() {
@@ -262,10 +342,21 @@ void ofApp::exit() {
         sessionLogger_->writeSummary();
         sessionLogger_.reset();
     }
+    sceneTransitionLogger_.flush();
     hapticLogger_.reset();
 }
 
 void ofApp::keyPressed(int key) {
+    const double nowSeconds = ofGetElapsedTimef();
+
+    if (allowKeyboardToggle_ && key == guiToggleKey_) {
+        guiKeyPressedAtSec_ = nowSeconds;
+    }
+
+    if (operationMode_ == "exhibition" && !guiOverrideVisible_) {
+        return;
+    }
+
     switch (key) {
         case '1':
             onStartButtonPressed();
@@ -296,10 +387,22 @@ void ofApp::keyPressed(int key) {
     }
 }
 
-void ofApp::keyReleased(int) {}
+void ofApp::keyReleased(int key) {
+    if (allowKeyboardToggle_ && key == guiToggleKey_) {
+        const double nowSeconds = ofGetElapsedTimef();
+        const double held = (guiKeyPressedAtSec_ > 0.0) ? nowSeconds - guiKeyPressedAtSec_ : 0.0;
+        if (guiToggleHoldTimeSec_ <= 0.0 || held >= guiToggleHoldTimeSec_) {
+            guiOverrideVisible_ = !guiOverrideVisible_;
+            ofLogNotice("ofApp") << "GUI override toggled via keyboard: " << (guiOverrideVisible_ ? "visible" : "hidden");
+        }
+        guiKeyPressedAtSec_ = 0.0;
+    }
+}
 void ofApp::mouseMoved(int, int) {}
 void ofApp::mouseDragged(int, int, int) {}
-void ofApp::mousePressed(int, int, int) {}
+void ofApp::mousePressed(int x, int y, int) {
+    updateCornerUnlock(ofGetElapsedTimef(), x, y);
+}
 void ofApp::mouseReleased(int, int, int) {}
 void ofApp::mouseScrolled(int, int, float, float) {}
 void ofApp::mouseEntered(int, int) {}
@@ -322,7 +425,7 @@ void ofApp::onStartButtonPressed() {
         return;
     }
     const double nowSeconds = ofGetElapsedTimef();
-    if (!sceneController_.requestState(SceneState::FirstPhase, nowSeconds)) {
+    if (!sceneController_.requestState(SceneState::Start, nowSeconds, true, "button_press")) {
         ofLogNotice("ofApp") << "Start request ignored.";
     }
 }
@@ -333,7 +436,7 @@ void ofApp::onEndButtonPressed() {
         return;
     }
     const double nowSeconds = ofGetElapsedTimef();
-    if (!sceneController_.requestState(SceneState::End, nowSeconds)) {
+    if (!sceneController_.requestState(SceneState::End, nowSeconds, true, "button_press")) {
         ofLogNotice("ofApp") << "End request ignored.";
     }
 }
@@ -344,7 +447,7 @@ void ofApp::onResetButtonPressed() {
         return;
     }
     const double nowSeconds = ofGetElapsedTimef();
-    if (!sceneController_.requestState(SceneState::Idle, nowSeconds)) {
+    if (!sceneController_.requestState(SceneState::Idle, nowSeconds, true, "button_press")) {
         ofLogNotice("ofApp") << "Reset request ignored.";
     }
 }
@@ -380,11 +483,11 @@ void ofApp::updateSceneGui(double nowSeconds) {
     std::string sceneLabel;
     if (transitioning) {
         std::ostringstream oss;
-        oss << sceneToString(current) << " → " << sceneToString(target);
+        oss << sceneStateToString(current) << " → " << sceneStateToString(target);
         oss << " (" << static_cast<int>(sceneController_.transitionBlend() * 100.0f) << "%)";
         sceneLabel = oss.str();
     } else {
-        sceneLabel = sceneToString(current);
+        sceneLabel = sceneStateToString(current);
     }
     sceneParam_.set(sceneLabel);
 
@@ -428,7 +531,6 @@ void ofApp::updateFakeSignal(double nowSeconds) {
     latestMetrics_.timestampSec = nowSeconds;
     latestMetrics_.bpm = bpm;
     latestMetrics_.envelope = env;
-    updateEnvelopeHistory(nowSeconds, env);
 
     const double beatIntervalSec = 60.0 / std::max(35.0f, bpm);
     if (nowSeconds - lastSimulatedBeatAt_ >= beatIntervalSec) {
@@ -436,13 +538,21 @@ void ofApp::updateFakeSignal(double nowSeconds) {
         appendHapticEvent(nowSeconds, ofClamp(0.4f + 0.5f * static_cast<float>(std::sin(phase * 1.3)), 0.0f, 1.0f),
                           "synthetic");
     }
+
+    signalHealth_.envelopeShort = env;
+    signalHealth_.envelopeMid = env;
+    signalHealth_.envelopeLong = env;
+    signalHealth_.bpmAverage = bpm;
+    signalHealth_.dropoutSeconds = 0.0f;
+    signalHealth_.fallbackActive = false;
+    signalHealth_.fallbackBlend = 0.0f;
+    signalHealth_.fallbackEnvelope = env;
 }
 
 void ofApp::applyBeatMetrics(const knot::audio::AudioPipeline::BeatMetrics& metrics, double nowSeconds) {
     latestMetrics_.timestampSec = nowSeconds;
     latestMetrics_.bpm = metrics.bpm;
     latestMetrics_.envelope = metrics.envelope;
-    updateEnvelopeHistory(nowSeconds, metrics.envelope);
 }
 
 void ofApp::handleBeatEvents(const std::vector<knot::audio::BeatEvent>& events, double nowSeconds) {
@@ -451,7 +561,8 @@ void ofApp::handleBeatEvents(const std::vector<knot::audio::BeatEvent>& events, 
             latestMetrics_.bpm = evt.bpm;
         }
         const float intensity = ofClamp(evt.envelope, 0.2f, 1.0f);
-        appendHapticEvent(nowSeconds, intensity, "detected");
+        const std::string label = signalHealth_.fallbackActive ? "fallback" : "detected";
+        appendHapticEvent(nowSeconds, intensity, label);
     }
 }
 
@@ -555,6 +666,76 @@ bool ofApp::ensureParentDirectory(const std::filesystem::path& path) {
     return true;
 }
 
+void ofApp::loadShaders() {
+    const auto loadShaderFn = [&](ofShader& shader, bool& loaded, const std::string& vert, const std::string& frag) {
+        loaded = false;
+        const std::string vertPath = ofToDataPath(vert, true);
+        const std::string fragPath = ofToDataPath(frag, true);
+        if (!ofFile::doesFileExist(vertPath) || !ofFile::doesFileExist(fragPath)) {
+            ofLogWarning("ofApp") << "Shader files not found: " << vert << " / " << frag;
+            return;
+        }
+        try {
+            loaded = shader.load(vert, frag);
+        } catch (const std::exception& ex) {
+            loaded = false;
+            ofLogWarning("ofApp") << "Failed to load shader (" << vert << ", " << frag << "): " << ex.what();
+        }
+        if (!loaded) {
+            ofLogWarning("ofApp") << "Shader compile failed for " << vert << " / " << frag;
+        }
+    };
+
+    loadShaderFn(starfieldShader_, starfieldShaderLoaded_, "shaders/starfield.vert", "shaders/starfield.frag");
+    loadShaderFn(torusShader_, torusShaderLoaded_, "shaders/torus.vert", "shaders/torus.frag");
+    loadShaderFn(rippleShader_, rippleShaderLoaded_, "shaders/ripple.vert", "shaders/ripple.frag");
+}
+
+void ofApp::drawStarfieldLayer(float alpha, double nowSeconds, float envelope) {
+    if (!starfieldShaderLoaded_) {
+        return;
+    }
+    const float clampedAlpha = std::clamp(alpha, 0.0f, 1.0f);
+    const float env = std::clamp(envelope, 0.0f, 1.0f);
+    ofFill();
+    starfieldShader_.begin();
+    starfieldShader_.setUniform2f("uResolution", static_cast<float>(ofGetWidth()), static_cast<float>(ofGetHeight()));
+    starfieldShader_.setUniform1f("uTime", static_cast<float>(nowSeconds));
+    starfieldShader_.setUniform1f("uEnvelope", env);
+    starfieldShader_.setUniform1f("uAlpha", clampedAlpha);
+    fullscreenQuadMesh().draw();
+    starfieldShader_.end();
+}
+
+void ofApp::drawRippleLayer(float alpha, double nowSeconds, float envelope) {
+    if (!rippleShaderLoaded_) {
+        return;
+    }
+    const float clampedAlpha = std::clamp(alpha, 0.0f, 1.0f);
+    const float env = std::clamp(envelope, 0.0f, 1.0f);
+    ofFill();
+    rippleShader_.begin();
+    rippleShader_.setUniform2f("uResolution", static_cast<float>(ofGetWidth()), static_cast<float>(ofGetHeight()));
+    rippleShader_.setUniform1f("uTime", static_cast<float>(nowSeconds));
+    rippleShader_.setUniform1f("uEnvelope", env);
+    rippleShader_.setUniform1f("uAlpha", clampedAlpha);
+    fullscreenQuadMesh().draw();
+    rippleShader_.end();
+}
+
+float ofApp::blendedEnvelope() const {
+    const float base = std::clamp(0.6f * signalHealth_.envelopeShort +
+                                      0.3f * signalHealth_.envelopeMid +
+                                      0.1f * signalHealth_.envelopeLong,
+                                  0.0f, 1.0f);
+    if (signalHealth_.fallbackActive) {
+        const float fallbackEnv = std::clamp(signalHealth_.fallbackEnvelope, 0.0f, 1.0f);
+        const float blend = std::clamp(signalHealth_.fallbackBlend, 0.0f, 1.0f);
+        return safeLerp(base, fallbackEnv, blend);
+    }
+    return base;
+}
+
 void ofApp::appendCalibrationReport(
     const std::array<knot::audio::ChannelCalibrationValue, 2>& values,
     const std::optional<knot::audio::EnvelopeCalibrationStats>& envelopeStats) {
@@ -588,10 +769,10 @@ void ofApp::appendCalibrationReport(
 
     const double gainDbCh1 = gainDb(values[0].gain);
     const double gainDbCh2 = gainDb(values[1].gain);
-    const bool gainOkCh1 = std::isfinite(gainDbCh1) && std::abs(gainDbCh1) <= 3.0;
-    const bool gainOkCh2 = std::isfinite(gainDbCh2) && std::abs(gainDbCh2) <= 3.0;
-    const bool delayOkCh1 = std::abs(values[0].delaySamples) <= 2;
-    const bool delayOkCh2 = std::abs(values[1].delaySamples) <= 2;
+    const bool gainOkCh1 = std::isfinite(gainDbCh1) && std::abs(gainDbCh1) <= 30.0;
+    const bool gainOkCh2 = std::isfinite(gainDbCh2) && std::abs(gainDbCh2) <= 30.0;
+    const bool delayOkCh1 = std::abs(values[0].delaySamples) <= 200;
+    const bool delayOkCh2 = std::abs(values[1].delaySamples) <= 200;
 
     auto okText = [](bool ok) { return ok ? "OK" : "NG"; };
 
@@ -626,7 +807,7 @@ void ofApp::appendCalibrationReport(
     }
 
     if (!(gainOkCh1 && gainOkCh2 && delayOkCh1 && delayOkCh2)) {
-        ofLogWarning("ofApp") << "Calibration exceeds thresholds."
+        ofLogWarning("ofApp") << "Calibration quality degraded (proceeding anyway)."
                                << " gainDbCh1=" << gainDbCh1
                                << " gainDbCh2=" << gainDbCh2
                                << " delayCh1=" << values[0].delaySamples
@@ -649,6 +830,89 @@ void ofApp::logEnvelopeCalibrationResult(const knot::audio::EnvelopeCalibrationS
     }
 
     appendCalibrationReport(audioPipeline_.calibrationResult(), stats);
+}
+
+void ofApp::processSceneTransitionEvents() {
+    while (const auto event = sceneController_.popTransitionEvent()) {
+        handleTransitionEvent(*event);
+    }
+}
+
+void ofApp::handleTransitionEvent(const SceneController::TransitionEvent& event) {
+    infra::SceneTransitionLogger::TransitionRecord record;
+    record.timestampMicros = static_cast<uint64_t>(event.timestamp * 1'000'000.0);
+    record.sceneFrom = event.from;
+    record.sceneTo = event.to;
+    record.transitionType = event.manual ? "manual" : "auto";
+    record.triggerReason = event.triggerReason.empty() ? (event.manual ? "manual" : "timeout") : event.triggerReason;
+    record.timeInStateSec = event.timeInState;
+    record.blendDurationSec = event.blendDuration;
+    record.completed = event.completed;
+
+    if (!event.manual && sceneTimingConfig_) {
+        if (const auto expected = sceneTimingConfig_->effectiveDuration(event.from)) {
+            record.expectedDurationSec = expected;
+            if (!event.completed) {
+                record.deviationSec = event.timeInState - *expected;
+            }
+        }
+    }
+
+    sceneTransitionLogger_.recordTransition(record);
+}
+
+bool ofApp::shouldDrawControlPanel() const {
+    return showControlPanel_ || guiOverrideVisible_;
+}
+
+bool ofApp::shouldDrawStatusPanel() const {
+    return showStatusPanel_ || guiOverrideVisible_;
+}
+
+void ofApp::updateCornerUnlock(double nowSeconds, int x, int y) {
+    if (!allowCornerUnlock_) {
+        return;
+    }
+
+    const glm::vec2 point(static_cast<float>(x), static_cast<float>(y));
+    const float margin = 48.0f;
+    const std::array<glm::vec2, 4> corners = {
+        glm::vec2(0.0f, 0.0f),
+        glm::vec2(static_cast<float>(ofGetWidth()), 0.0f),
+        glm::vec2(0.0f, static_cast<float>(ofGetHeight())),
+        glm::vec2(static_cast<float>(ofGetWidth()), static_cast<float>(ofGetHeight()))};
+
+    bool nearCorner = false;
+    for (const auto& corner : corners) {
+        if (glm::distance(point, corner) <= margin) {
+            nearCorner = true;
+            break;
+        }
+    }
+    if (!nearCorner) {
+        return;
+    }
+
+    cornerTouches_.emplace_back(nowSeconds, point);
+    cornerTouches_.erase(std::remove_if(cornerTouches_.begin(), cornerTouches_.end(), [&](const auto& entry) {
+                              return nowSeconds - entry.first > cornerUnlockWindowSec_;
+                          }),
+        cornerTouches_.end());
+
+    std::array<bool, 4> activated {false, false, false, false};
+    for (const auto& entry : cornerTouches_) {
+        for (size_t i = 0; i < corners.size(); ++i) {
+            if (glm::distance(entry.second, corners[i]) <= margin) {
+                activated[i] = true;
+            }
+        }
+    }
+
+    if (std::all_of(activated.begin(), activated.end(), [](bool v) { return v; })) {
+        guiOverrideVisible_ = !guiOverrideVisible_;
+        cornerTouches_.clear();
+        ofLogNotice("ofApp") << "GUI override toggled via corner unlock: " << (guiOverrideVisible_ ? "visible" : "hidden");
+    }
 }
 
 std::string ofApp::makeCalibrationStatusText() const {
@@ -686,8 +950,17 @@ void ofApp::drawScene(SceneState state, float alpha, double nowSeconds) {
             case SceneState::Idle:
                 drawIdleScene(layerAlpha, nowSeconds);
                 break;
+            case SceneState::Start:
+                drawStartScene(layerAlpha, nowSeconds);
+                break;
             case SceneState::FirstPhase:
                 drawFirstPhaseScene(layerAlpha, nowSeconds);
+                break;
+            case SceneState::Exchange:
+                drawExchangeScene(layerAlpha, nowSeconds);
+                break;
+            case SceneState::Mixed:
+                drawMixedScene(layerAlpha, nowSeconds);
                 break;
             case SceneState::End:
                 drawEndScene(layerAlpha);
@@ -707,47 +980,189 @@ void ofApp::drawScene(SceneState state, float alpha, double nowSeconds) {
 void ofApp::drawIdleScene(float alpha, double nowSeconds) {
     ofPushStyle();
     const float clampedAlpha = std::clamp(alpha, 0.0f, 1.0f);
-    ofColor background(8, 9, 18);
-    background.a = static_cast<unsigned char>(clampedAlpha * 255.0f);
-    ofSetColor(background);
-    ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
-
-    ofSetColor(220, 240, 255, static_cast<int>(clampedAlpha * 200.0f));
-    ofDrawBitmapString("Idle — 入力監視中 / 環境整備フェーズ", 40, 80);
-
     const float envelope = latestMetrics_.envelope;
     const float baseRadius = 180.0f;
     const float radiusOffset = envelope * 240.0f;
     const float centerY = ofGetHeight() * 0.5f;
 
-    ofNoFill();
-    ofSetLineWidth(2.0f);
-    ofColor rippleBase(120, 140, 255, static_cast<unsigned char>(safeLerp(20.0f, 90.0f, envelope)));
+    if (starfieldShaderLoaded_) {
+        drawStarfieldLayer(clampedAlpha, nowSeconds, envelope);
+    } else {
+        ofColor background(8, 9, 18);
+        background.a = static_cast<unsigned char>(clampedAlpha * 255.0f);
+        ofSetColor(background);
+        ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
 
-    for (int i = 0; i < 3; ++i) {
-        const float falloff = std::max(0.0f, 1.0f - i * 0.28f);
-        ofColor rippleColor = rippleBase;
-        rippleColor.a = static_cast<unsigned char>(rippleColor.a * falloff * clampedAlpha);
-        const float radius = baseRadius + radiusOffset + i * 36.0f;
-        ofSetColor(rippleColor);
-        ofDrawCircle(ofGetWidth() * 0.3f, centerY, radius);
-        ofDrawCircle(ofGetWidth() * 0.7f, centerY, radius);
+        ofFill();
+        ofColor starBase(255, 255, 255, static_cast<unsigned char>(clampedAlpha * 90.0f));
+        const int starCount = 120;
+        for (int i = 0; i < starCount; ++i) {
+            const float u = static_cast<float>(i) / starCount;
+            const float x = u * ofGetWidth();
+            const float y = std::fmod(static_cast<float>(i) * 53.0f + static_cast<float>(nowSeconds) * 40.0f,
+                                      static_cast<float>(ofGetHeight()));
+            const float radius = 1.0f + 1.2f * std::sin(nowSeconds * 0.8 + i * 0.25f);
+            ofColor starColor = starBase;
+            starColor.a = static_cast<unsigned char>(
+                starBase.a * (0.6f + 0.4f * std::sin(nowSeconds * 0.5f + i * 0.2f)));
+            ofSetColor(starColor);
+            ofDrawCircle(x, y, radius);
+        }
     }
 
-    ofFill();
-    ofColor starBase(255, 255, 255, static_cast<unsigned char>(clampedAlpha * 90.0f));
-    const int starCount = 120;
-    for (int i = 0; i < starCount; ++i) {
-        const float u = static_cast<float>(i) / starCount;
-        const float x = u * ofGetWidth();
-        const float y = std::fmod(static_cast<float>(i) * 53.0f + static_cast<float>(nowSeconds) * 40.0f,
-                                  static_cast<float>(ofGetHeight()));
-        const float radius = 1.0f + 1.2f * std::sin(nowSeconds * 0.8 + i * 0.25f);
-        ofColor starColor = starBase;
-        starColor.a = static_cast<unsigned char>(
-            starBase.a * (0.6f + 0.4f * std::sin(nowSeconds * 0.5f + i * 0.2f)));
-        ofSetColor(starColor);
-        ofDrawCircle(x, y, radius);
+    if (rippleShaderLoaded_) {
+        drawRippleLayer(clampedAlpha, nowSeconds, envelope);
+    } else {
+        ofNoFill();
+        ofSetLineWidth(2.0f);
+        ofColor rippleBase(120, 140, 255, static_cast<unsigned char>(safeLerp(20.0f, 90.0f, envelope)));
+
+        for (int i = 0; i < 3; ++i) {
+            const float falloff = std::max(0.0f, 1.0f - i * 0.28f);
+            ofColor rippleColor = rippleBase;
+            rippleColor.a = static_cast<unsigned char>(rippleColor.a * falloff * clampedAlpha);
+            const float radius = baseRadius + radiusOffset + i * 36.0f;
+            ofSetColor(rippleColor);
+            ofDrawCircle(ofGetWidth() * 0.3f, centerY, radius);
+            ofDrawCircle(ofGetWidth() * 0.7f, centerY, radius);
+        }
+        ofFill();
+    }
+
+    ofSetColor(220, 240, 255, static_cast<int>(clampedAlpha * 200.0f));
+    const std::string idleText = "Idle — 入力監視中 / 環境整備フェーズ";
+    if (guideFont_.isLoaded()) {
+        guideFont_.drawString(idleText, 40.0f, 80.0f);
+    } else {
+        ofDrawBitmapString(idleText, 40, 80);
+    }
+
+    ofPopStyle();
+}
+
+void ofApp::drawStartScene(float alpha, double nowSeconds) {
+    ofPushStyle();
+    const float clampedAlpha = std::clamp(alpha, 0.0f, 1.0f);
+    const double timeInState = sceneController_.timeInState(nowSeconds);
+    const float envelope = latestMetrics_.envelope;
+
+    if (starfieldShaderLoaded_) {
+        drawStarfieldLayer(clampedAlpha, nowSeconds, envelope);
+    } else {
+        ofColor background(12, 10, 28);
+        background.a = static_cast<unsigned char>(clampedAlpha * 255.0f);
+        ofSetColor(background);
+        ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
+    }
+
+    const auto stageLookup = [&](const std::string& name) -> const SceneTimingConfig::Stage* {
+        if (!sceneTimingConfig_) {
+            return nullptr;
+        }
+        return sceneTimingConfig_->findStage(SceneState::Start, name);
+    };
+
+    const auto stageProgress = [&](const SceneTimingConfig::Stage* stage) -> float {
+        if (stage == nullptr || stage->duration <= 0.0) {
+            return 0.0f;
+        }
+        const double local = timeInState - stage->startAt;
+        if (local <= 0.0) {
+            return 0.0f;
+        }
+        if (local >= stage->duration) {
+            return 1.0f;
+        }
+        return static_cast<float>(local / stage->duration);
+    };
+
+    const SceneTimingConfig::Stage* fadeInStage = stageLookup("textFadeIn");
+    const SceneTimingConfig::Stage* fadeOutStage = stageLookup("textFadeOut");
+    float fadeInFactor = fadeInStage ? stageProgress(fadeInStage) : std::clamp(static_cast<float>(timeInState), 0.0f, 1.0f);
+    float fadeOutFactor = 1.0f;
+    if (fadeOutStage && timeInState >= fadeOutStage->startAt) {
+        const float progress = stageProgress(fadeOutStage);
+        fadeOutFactor = std::clamp(1.0f - progress, 0.0f, 1.0f);
+    }
+
+    const std::string title = "体験を始めます";
+    const float titleAlpha = clampedAlpha * fadeInFactor * fadeOutFactor;
+    if (titleAlpha > 0.01f) {
+        ofSetColor(255, 255, 255, static_cast<int>(titleAlpha * 255.0f));
+        if (displayFont_.isLoaded()) {
+            const float textWidth = displayFont_.stringWidth(title);
+            const float textHeight = displayFont_.stringHeight(title);
+            const float x = (ofGetWidth() - textWidth) * 0.5f;
+            const float y = ofGetHeight() * 0.33f + textHeight * 0.5f;
+            displayFont_.drawString(title, x, y);
+        } else {
+            ofDrawBitmapStringHighlight(title, ofGetWidth() * 0.5f - 80.0f, ofGetHeight() * 0.35f);
+        }
+    }
+
+    const SceneTimingConfig::Stage* breathingStage = stageLookup("breathingGuide");
+    float breathingEnvelope = 0.0f;
+    if (breathingStage) {
+        const double local = timeInState - breathingStage->startAt;
+        if (local >= 0.0 && local <= breathingStage->duration) {
+            const double norm = breathingStage->duration > 0.0 ? local / breathingStage->duration : 0.0;
+            const double envelope = std::clamp(std::min(norm, 1.0 - norm) * 2.0, 0.0, 1.0);
+            breathingEnvelope = static_cast<float>(envelope);
+        }
+    }
+
+    if (breathingEnvelope > 0.01f) {
+        const float pulse = 0.5f + 0.5f * static_cast<float>(std::sin(nowSeconds * 1.2));
+        const float radius = safeLerp(90.0f, 160.0f, pulse);
+        ofNoFill();
+        ofSetLineWidth(6.0f);
+        ofColor ringColor(180, 200, 255, static_cast<unsigned char>(clampedAlpha * breathingEnvelope * 160.0f));
+        ofSetColor(ringColor);
+        ofDrawCircle(glm::vec2(ofGetWidth() * 0.5f, ofGetHeight() * 0.55f), radius);
+        const std::string guidance = "ゆっくり深呼吸を 3 回行ってください";
+        ofSetColor(240, 240, 240, static_cast<int>(clampedAlpha * breathingEnvelope * 220.0f));
+        if (guideFont_.isLoaded()) {
+            const float gw = guideFont_.stringWidth(guidance);
+            guideFont_.drawString(guidance, (ofGetWidth() - gw) * 0.5f, ofGetHeight() * 0.65f);
+        } else {
+            ofDrawBitmapString(guidance, ofGetWidth() * 0.5f - 140.0f, ofGetHeight() * 0.65f);
+        }
+    }
+
+    const SceneTimingConfig::Stage* bellStage = stageLookup("bellSound");
+    if (bellStage) {
+        const double local = timeInState - bellStage->startAt;
+        if (local >= 0.0 && local <= bellStage->duration) {
+            const float bellAlpha = clampedAlpha * static_cast<float>(1.0 - std::clamp(local / bellStage->duration, 0.0, 1.0));
+            ofSetColor(255, 210, 140, static_cast<int>(bellAlpha * 255.0f));
+            const std::string bellText = "🔔 深呼吸のリズムに合わせてベルが鳴ります";
+            if (guideFont_.isLoaded()) {
+                const float w = guideFont_.stringWidth(bellText);
+                guideFont_.drawString(bellText, (ofGetWidth() - w) * 0.5f, ofGetHeight() * 0.8f);
+            } else {
+                ofDrawBitmapString(bellText, ofGetWidth() * 0.5f - 160.0f, ofGetHeight() * 0.8f);
+            }
+        }
+    }
+
+    if (!starfieldShaderLoaded_) {
+        ofFill();
+        ofColor starBase(255, 255, 255, static_cast<unsigned char>(clampedAlpha * 70.0f));
+        const int starCount = 140;
+        for (int i = 0; i < starCount; ++i) {
+            const float u = static_cast<float>(i) / starCount;
+            const float x = u * ofGetWidth();
+            const float y = std::fmod(static_cast<float>(i) * 47.0f + static_cast<float>(nowSeconds) * 30.0f,
+                                      static_cast<float>(ofGetHeight()));
+            const float radius = 1.2f + 1.5f * std::sin(nowSeconds * 0.6 + i * 0.18f);
+            ofColor starColor = starBase;
+            starColor.a = static_cast<unsigned char>(starBase.a * (0.5f + 0.5f * std::sin(nowSeconds * 0.4f + i * 0.3f)));
+            ofSetColor(starColor);
+            ofDrawCircle(x, y, radius);
+        }
+    } else if (rippleShaderLoaded_) {
+        const float rippleEnvelope = std::max(envelope, breathingEnvelope);
+        drawRippleLayer(clampedAlpha * 0.6f, nowSeconds, rippleEnvelope);
     }
 
     ofPopStyle();
@@ -763,7 +1178,12 @@ void ofApp::drawFirstPhaseScene(float alpha, double nowSeconds) {
     ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
 
     ofSetColor(255, 255, 255, static_cast<int>(clampedAlpha * 220.0f));
-    ofDrawBitmapString("First Phase — 心音提示＆同期フェーズ", 40, 80);
+    const std::string title = "First Phase — 心音提示＆同期フェーズ";
+    if (guideFont_.isLoaded()) {
+        guideFont_.drawString(title, 40.0f, 80.0f);
+    } else {
+        ofDrawBitmapString(title, 40, 80);
+    }
 
     const float envelope = latestMetrics_.envelope;
     const float pulseStrength = safeLerp(0.25f, 1.0f, envelope);
@@ -790,7 +1210,16 @@ void ofApp::drawFirstPhaseScene(float alpha, double nowSeconds) {
             safeLerp(0.4f, 0.9f, pulseStrength),
             std::clamp(clampedAlpha * 0.35f, 0.0f, 1.0f)));
     }
-    mesh.draw();
+    if (torusShaderLoaded_) {
+        torusShader_.begin();
+        torusShader_.setUniform1f("uTime", static_cast<float>(nowSeconds));
+        torusShader_.setUniform1f("uEnvelope", pulseStrength);
+        torusShader_.setUniform1f("uAlpha", clampedAlpha);
+        mesh.draw();
+        torusShader_.end();
+    } else {
+        mesh.draw();
+    }
 
     ofSetColor(240, 160, 120, static_cast<int>(clampedAlpha * 180.0f));
     const float ringRadius = safeLerp(40.0f, 90.0f, envelope);
@@ -814,6 +1243,116 @@ void ofApp::drawFirstPhaseScene(float alpha, double nowSeconds) {
     ofPopStyle();
 }
 
+void ofApp::drawExchangeScene(float alpha, double nowSeconds) {
+    ofPushStyle();
+    const float clampedAlpha = std::clamp(alpha, 0.0f, 1.0f);
+
+    ofColor background(16, 12, 32);
+    background.a = static_cast<unsigned char>(clampedAlpha * 255.0f);
+    ofSetColor(background);
+    ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
+
+    ofSetColor(255, 255, 255, static_cast<int>(clampedAlpha * 210.0f));
+    const std::string title = "Exchange — 心音を交換中";
+    if (guideFont_.isLoaded()) {
+        guideFont_.drawString(title, 40.0f, 80.0f);
+    } else {
+        ofDrawBitmapString(title, 40, 80);
+    }
+
+    const float envelope = latestMetrics_.envelope;
+    const glm::vec2 leftCenter(ofGetWidth() * 0.35f, ofGetHeight() * 0.52f);
+    const glm::vec2 rightCenter(ofGetWidth() * 0.65f, ofGetHeight() * 0.48f);
+
+    const float exchangePhase = 0.5f + 0.5f * static_cast<float>(std::sin(nowSeconds * 0.8));
+    const float leftRadius = safeLerp(140.0f, 260.0f, envelope);
+    const float rightRadius = safeLerp(140.0f, 260.0f, exchangePhase);
+
+    ofNoFill();
+    ofSetLineWidth(7.0f);
+    ofColor leftColor(110, 200, 255, static_cast<unsigned char>(clampedAlpha * 190.0f));
+    ofSetColor(leftColor);
+    ofDrawCircle(leftCenter, leftRadius);
+    ofColor rightColor(255, 150, 190, static_cast<unsigned char>(clampedAlpha * 190.0f));
+    ofSetColor(rightColor);
+    ofDrawCircle(rightCenter, rightRadius);
+
+    const int particleCount = 32;
+    ofFill();
+    for (int i = 0; i < particleCount; ++i) {
+        const float t = (static_cast<float>(i) + static_cast<float>(nowSeconds) * 0.6f) / particleCount;
+        const float blend = std::fmod(t, 1.0f);
+        const glm::vec2 pos = glm::mix(leftCenter, rightCenter, blend);
+        const float size = 4.0f + 3.0f * std::sin(nowSeconds * 1.4f + i * 0.3f);
+        ofColor particleColor = leftColor.getLerped(rightColor, blend);
+        particleColor.a = static_cast<unsigned char>(particleColor.a * clampedAlpha * 0.8f);
+        ofSetColor(particleColor);
+        ofDrawCircle(pos, size);
+    }
+
+    ofColor linkColor(200, 180, 255, static_cast<unsigned char>(clampedAlpha * 120.0f));
+    ofSetColor(linkColor);
+    ofSetLineWidth(3.0f);
+    const glm::vec2 topControl(ofGetWidth() * 0.5f, ofGetHeight() * 0.28f);
+    const glm::vec2 bottomControl(ofGetWidth() * 0.5f, ofGetHeight() * 0.75f);
+    ofDrawBezier(leftCenter.x, leftCenter.y, topControl.x, topControl.y, bottomControl.x, bottomControl.y, rightCenter.x,
+                 rightCenter.y);
+
+    ofPopStyle();
+}
+
+void ofApp::drawMixedScene(float alpha, double nowSeconds) {
+    ofPushStyle();
+    const float clampedAlpha = std::clamp(alpha, 0.0f, 1.0f);
+
+    ofColor background(18, 14, 24);
+    background.a = static_cast<unsigned char>(clampedAlpha * 255.0f);
+    ofSetColor(background);
+    ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
+
+    ofSetColor(255, 255, 255, static_cast<int>(clampedAlpha * 210.0f));
+    const std::string title = "Mixed — 共鳴のハーモニー";
+    if (guideFont_.isLoaded()) {
+        guideFont_.drawString(title, 40.0f, 80.0f);
+    } else {
+        ofDrawBitmapString(title, 40, 80);
+    }
+
+    const float envelope = latestMetrics_.envelope;
+    const float noisePhase = static_cast<float>(std::sin(nowSeconds * 0.5));
+    const float radius = safeLerp(160.0f, 320.0f, envelope);
+
+    ofMesh mesh;
+    mesh.setMode(OF_PRIMITIVE_TRIANGLE_FAN);
+    const glm::vec2 center(ofGetWidth() * 0.5f, ofGetHeight() * 0.55f);
+    mesh.addVertex(glm::vec3(center, 0.0f));
+    mesh.addColor(ofFloatColor(0.0f, 0.0f, 0.0f, 0.0f));
+
+    const int segments = 180;
+    for (int i = 0; i <= segments; ++i) {
+        const float angle = ofDegToRad(static_cast<float>(i) / segments * 360.0f);
+        const float wobble = 1.0f + 0.06f * std::sin(nowSeconds * 1.1f + i * 0.27f);
+        const float r = radius * wobble;
+        const glm::vec2 pos = center + glm::vec2(std::cos(angle), std::sin(angle)) * r;
+        const float hueMix = 0.5f + 0.5f * std::sin(angle * 3.0f + noisePhase);
+        const ofFloatColor color = ofFloatColor::fromHsb(ofWrap(hueMix * 0.08f + 0.55f, 0.0f, 1.0f), 0.7f, 0.9f,
+                                                         clampedAlpha * 0.6f);
+        mesh.addVertex(glm::vec3(pos, 0.0f));
+        mesh.addColor(color);
+    }
+    mesh.draw();
+
+    ofEnableBlendMode(OF_BLENDMODE_ADD);
+    ofSetColor(255, 220, 200, static_cast<int>(clampedAlpha * 120.0f));
+    for (int i = 0; i < 5; ++i) {
+        const float pulse = static_cast<float>(std::sin(nowSeconds * 0.7f + i * 0.6f) * 0.5f + 0.5f);
+        ofDrawCircle(center, safeLerp(40.0f, radius * 0.7f, pulse));
+    }
+    ofDisableBlendMode();
+
+    ofPopStyle();
+}
+
 void ofApp::drawEndScene(float alpha) {
     ofPushStyle();
     const float clampedAlpha = std::clamp(alpha, 0.0f, 1.0f);
@@ -823,7 +1362,12 @@ void ofApp::drawEndScene(float alpha) {
     ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
 
     ofSetColor(240, 200, 200, static_cast<int>(clampedAlpha * 200.0f));
-    ofDrawBitmapString("End — セッション終了。ログとサマリを確認してください。", 40, 80);
+    const std::string title = "End — セッション終了。ログとサマリを確認してください。";
+    if (guideFont_.isLoaded()) {
+        guideFont_.drawString(title, 40.0f, 80.0f);
+    } else {
+        ofDrawBitmapString(title, 40, 80);
+    }
     ofPopStyle();
 }
 
@@ -951,7 +1495,45 @@ void ofApp::drawHapticLog(const ofRectangle& area, double nowSeconds) const {
 }
 
 bool ofApp::isInteractionLocked() const {
-    return audioPipeline_.isCalibrationActive() || audioPipeline_.isEnvelopeCalibrationActive() || envelopeCalibrationRunning_;
+    if (audioPipeline_.isCalibrationActive()) {
+        return true;
+    }
+    if (audioPipeline_.isEnvelopeCalibrationActive()) {
+        return true;
+    }
+    if (sceneController_.isTransitioning()) {
+        return true;
+    }
+
+    const double nowSeconds = ofGetElapsedTimef();
+    const SceneState current = sceneController_.currentState();
+    const double timeInStateSec = sceneController_.timeInState(nowSeconds);
+
+    if (current == SceneState::Start) {
+        double lockUntil = 11.0;
+        if (sceneTimingConfig_) {
+            if (const auto* stage = sceneTimingConfig_->findStage(SceneState::Start, "textFadeOut")) {
+                lockUntil = std::max(lockUntil, stage->startAt + stage->duration);
+            }
+        }
+        if (timeInStateSec < lockUntil) {
+            return true;
+        }
+    }
+
+    if (current == SceneState::End) {
+        double lockUntil = 10.0;
+        if (sceneTimingConfig_) {
+            if (const auto* stage = sceneTimingConfig_->findStage(SceneState::End, "fadeOut")) {
+                lockUntil = stage->startAt + stage->duration;
+            }
+        }
+        if (timeInStateSec < lockUntil) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 float ofApp::computeHapticRatePerMinute(double nowSeconds) const {
@@ -998,6 +1580,9 @@ std::string ofApp::buildGuidanceMessage(double /*nowSeconds*/) const {
     }
     if (weakSignalWarning_) {
         return "心音信号が弱い可能性があります。マイク位置と胸ピース固定を確認してください。";
+    }
+    if (signalHealth_.fallbackActive) {
+        return "実入力が不安定なため推定波形を表示中です。マイク接続とゲインを点検してください。";
     }
     if (simulateTelemetry_) {
         return "シミュレーション信号を再生中です。実入力を確認するには Synthetic Signal を OFF にしてください。";
@@ -1059,6 +1644,13 @@ void ofApp::drawCalibrationStatus() const {
     if (weakSignalWarning_) {
         lines.push_back({"警告: 心音エンベロープが閾値を下回っています。マイク位置とゲインを点検してください。",
                          ofColor(255, 200, 140)});
+    }
+    if (signalHealth_.fallbackActive) {
+        std::ostringstream oss;
+        oss << "情報: 推定モード稼働中 — dropout=" << std::fixed << std::setprecision(2)
+            << signalHealth_.dropoutSeconds << "s";
+        oss << std::defaultfloat;
+        lines.push_back({oss.str(), ofColor(255, 220, 140)});
     }
 
     if (simulateTelemetry_) {

@@ -1,5 +1,7 @@
 #include "AudioPipeline.h"
 
+#include "Utility.h"
+
 #include "ofMain.h"
 
 #include <algorithm>
@@ -28,11 +30,28 @@ void AudioPipeline::setup(double sampleRate, std::size_t bufferSize) {
     lastEnvelopeCalibration_ = {};
     envelopeCalibrationActive_ = false;
     newEnvelopeCalibrationAvailable_ = false;
+    envelopeShortAvg_ = 0.0f;
+    envelopeMidAvg_ = 0.0f;
+    envelopeLongAvg_ = 0.0f;
+    bpmAvg_ = 0.0f;
+    lastRealBeatSample_ = 0.0;
+    lastHealthUpdateSec_ = 0.0;
+    fallbackActive_ = false;
+    fallbackBlend_ = 0.0f;
+    fallbackEnvelope_ = 0.0f;
+    fallbackBpm_ = 60.0f;
+    lastFallbackEmitSec_ = 0.0;
+    signalHealth_ = {};
 }
 
 void AudioPipeline::setNoiseSeed(std::uint32_t seed) {
     std::lock_guard<std::mutex> lock(mutex_);
     rng_.seed(seed);
+}
+
+void AudioPipeline::setInputGainDb(float gainDb) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    inputGainLinear_ = dbToLinear(gainDb);
 }
 
 void AudioPipeline::ensureBufferSizes(std::size_t numFrames) {
@@ -74,6 +93,17 @@ void AudioPipeline::startCalibration() {
     totalSamplesProcessed_ = 0.0;
     envelopeCalibrationActive_ = false;
     newEnvelopeCalibrationAvailable_ = false;
+    envelopeShortAvg_ = 0.0f;
+    envelopeMidAvg_ = 0.0f;
+    envelopeLongAvg_ = 0.0f;
+    bpmAvg_ = 0.0f;
+    fallbackActive_ = false;
+    fallbackBlend_ = 0.0f;
+    fallbackEnvelope_ = 0.0f;
+    lastFallbackEmitSec_ = 0.0;
+    signalHealth_ = {};
+    lastRealBeatSample_ = totalSamplesProcessed_;
+    lastHealthUpdateSec_ = totalSamplesProcessed_ / sampleRate_;
 }
 
 bool AudioPipeline::isCalibrationActive() const {
@@ -106,12 +136,12 @@ float AudioPipeline::envelopeCalibrationProgress() const {
     return beatTimeline_.calibrationProgress();
 }
 
-BeatTimeline::EnvelopeCalibrationStats AudioPipeline::lastEnvelopeCalibration() const {
+EnvelopeCalibrationStats AudioPipeline::lastEnvelopeCalibration() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return lastEnvelopeCalibration_;
 }
 
-bool AudioPipeline::pollEnvelopeCalibrationStats(BeatTimeline::EnvelopeCalibrationStats& stats) {
+bool AudioPipeline::pollEnvelopeCalibrationStats(EnvelopeCalibrationStats& stats) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!newEnvelopeCalibrationAvailable_) {
         return false;
@@ -133,11 +163,17 @@ void AudioPipeline::audioIn(const ofSoundBuffer& buffer) {
 
     if (calibrationArmed_) {
         calibrationSession_.capture(input, numFrames);
+        totalSamplesProcessed_ += static_cast<double>(numFrames);
+        signalHealth_ = {};
     } else {
         const bool wasEnvelopeCalibrating = beatTimeline_.isEnvelopeCalibrating();
         for (std::size_t frame = 0; frame < numFrames; ++frame) {
             float ch1 = input[frame * 2];
             float ch2 = input[frame * 2 + 1];
+            if (inputGainLinear_ != 1.0f) {
+                ch1 = std::clamp(ch1 * inputGainLinear_, -1.0f, 1.0f);
+                ch2 = std::clamp(ch2 * inputGainLinear_, -1.0f, 1.0f);
+            }
             applyCalibration(ch1, ch2);
             monoBuffer_[frame] = 0.5f * (ch1 + ch2);
         }
@@ -156,6 +192,10 @@ void AudioPipeline::audioIn(const ofSoundBuffer& buffer) {
                     pendingEvents_.pop_front();
                 }
             }
+            if (metrics_.bpm > 1.0f) {
+                bpmAvg_ = bpmAvg_ + 0.25f * (metrics_.bpm - bpmAvg_);
+            }
+            lastRealBeatSample_ = totalSamplesProcessed_;
         }
         const bool isEnvelopeCalibrating = beatTimeline_.isEnvelopeCalibrating();
         if (wasEnvelopeCalibrating && !isEnvelopeCalibrating) {
@@ -165,6 +205,63 @@ void AudioPipeline::audioIn(const ofSoundBuffer& buffer) {
         } else {
             envelopeCalibrationActive_ = isEnvelopeCalibrating;
         }
+
+        const float env = metrics_.envelope;
+        envelopeShortAvg_ = envelopeShortAvg_ + 0.35f * (env - envelopeShortAvg_);
+        envelopeMidAvg_ = envelopeMidAvg_ + 0.12f * (env - envelopeMidAvg_);
+        envelopeLongAvg_ = envelopeLongAvg_ + 0.03f * (env - envelopeLongAvg_);
+
+        const double nowSec = totalSamplesProcessed_ / sampleRate_;
+        const double dropoutSec = (totalSamplesProcessed_ - lastRealBeatSample_) / sampleRate_;
+        const double deltaSec = std::max(0.0, nowSec - lastHealthUpdateSec_);
+        lastHealthUpdateSec_ = nowSec;
+
+        constexpr double kFallbackStartThreshold = 1.5;
+        constexpr double kFallbackStopThreshold = 0.6;
+
+        if (!fallbackActive_) {
+            if (dropoutSec > kFallbackStartThreshold) {
+                fallbackActive_ = true;
+                fallbackBlend_ = 0.0f;
+                fallbackBpm_ = std::clamp(bpmAvg_ > 1.0f ? bpmAvg_ : 60.0f, 20.0f, 140.0f);
+                fallbackEnvelope_ = std::clamp(envelopeLongAvg_, 0.18f, 0.6f);
+                const double interval = 60.0 / fallbackBpm_;
+                lastFallbackEmitSec_ = std::max(nowSec - interval, 0.0);
+            }
+        } else {
+            if (dropoutSec < kFallbackStopThreshold) {
+                fallbackBlend_ = std::max(0.0f, fallbackBlend_ - static_cast<float>(deltaSec / 0.8));
+                if (fallbackBlend_ <= 0.02f) {
+                    fallbackActive_ = false;
+                    fallbackBlend_ = 0.0f;
+                }
+            } else {
+                fallbackBlend_ = std::min(1.0f, fallbackBlend_ + static_cast<float>(deltaSec / 1.0));
+                const float targetEnv = std::clamp(envelopeLongAvg_, 0.18f, 0.6f);
+                fallbackEnvelope_ = fallbackEnvelope_ + 0.1f * (targetEnv - fallbackEnvelope_);
+                const double interval = 60.0 / fallbackBpm_;
+                while (nowSec - lastFallbackEmitSec_ >= interval) {
+                    lastFallbackEmitSec_ += interval;
+                    BeatEvent evt;
+                    evt.timestampSec = lastFallbackEmitSec_;
+                    evt.bpm = fallbackBpm_;
+                    evt.envelope = fallbackEnvelope_;
+                    pendingEvents_.push_back(evt);
+                    if (pendingEvents_.size() > 128) {
+                        pendingEvents_.pop_front();
+                    }
+                }
+            }
+        }
+
+        signalHealth_.envelopeShort = envelopeShortAvg_;
+        signalHealth_.envelopeMid = envelopeMidAvg_;
+        signalHealth_.envelopeLong = envelopeLongAvg_;
+        signalHealth_.bpmAverage = bpmAvg_;
+        signalHealth_.dropoutSeconds = static_cast<float>(dropoutSec);
+        signalHealth_.fallbackActive = fallbackActive_;
+        signalHealth_.fallbackBlend = fallbackBlend_;
+        signalHealth_.fallbackEnvelope = fallbackActive_ ? fallbackEnvelope_ : envelopeLongAvg_;
     }
 }
 
@@ -219,6 +316,11 @@ void AudioPipeline::audioOut(ofSoundBuffer& buffer) {
     }
 
     limiterReductionDb_ = limiter_.lastReductionDb();
+}
+
+AudioPipeline::SignalHealth AudioPipeline::signalHealth() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return signalHealth_;
 }
 
 AudioPipeline::BeatMetrics AudioPipeline::latestMetrics() const {

@@ -1,0 +1,15 @@
+{
+    "avgBpm": 66.26839164207722,
+    "durationSec": 159.999387,
+    "rmssdMs": 1275.8249867193283,
+    "sampleCount": 609,
+    "sdnnMs": 1673.582568147957,
+    "timestampMicros": {
+        "end": 162960789,
+        "start": 2961402
+    },
+    "wallClockUtc": {
+        "end": "2025-10-28T16:51:30Z",
+        "start": "2025-10-28T16:48:50Z"
+    }
+}

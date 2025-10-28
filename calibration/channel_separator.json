@@ -1,0 +1,18 @@
+{
+  "channels": [
+    {
+      "delaySamples": 136,
+      "gain": 27.966468811035156,
+      "name": "CH1",
+      "phaseDeg": 25.42854881286621
+    },
+    {
+      "delaySamples": 34,
+      "gain": 3.981050968170166,
+      "name": "CH2",
+      "phaseDeg": 85.9465560913086
+    }
+  ],
+  "createdUtc": "2025-10-29T01:48:57Z",
+  "version": 1
+}

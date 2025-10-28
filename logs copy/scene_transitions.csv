@@ -1,0 +1,3 @@
+timestampMicros,sceneFrom,sceneTo,transitionType,triggerReason,timeInStateSec,expectedDurationSec,deviationSec,blendDurationSec,completed
+56131748,Idle,Start,manual,button_press,54.865,null,null,1.200,0
+57348386,Idle,Start,manual,button_press,1.217,null,null,1.200,1
