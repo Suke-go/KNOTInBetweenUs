@@ -169,4 +169,11 @@ private:
     bool starfieldShaderLoaded_ = false;
     bool torusShaderLoaded_ = false;
     bool rippleShaderLoaded_ = false;
+    ofSoundPlayer bellSound_;
+    bool bellSoundLoaded_ = false;
+    float audioFadeGain_ = 1.0f;
+    float targetAudioFadeGain_ = 1.0f;
+    double audioFadeStartTime_ = 0.0;
+    double audioFadeDuration_ = 10.0;
+    bool audioFading_ = false;
 };

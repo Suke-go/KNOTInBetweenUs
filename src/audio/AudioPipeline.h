@@ -2,15 +2,18 @@
 
 #include "BeatTimeline.h"
 #include "Calibration.h"
+#include "ParticipantId.h"
 #include "SimpleLimiter.h"
 #include "Utility.h"
 
 #include "ofSoundBuffer.h"
 
 #include <array>
+#include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -39,7 +42,15 @@ public:
     void audioIn(const ofSoundBuffer& buffer);
     void audioOut(ofSoundBuffer& buffer);
 
-    const BeatTimeline& beatTimeline() const { return beatTimeline_; }
+    struct ChannelMetrics {
+        float bpm = 0.0f;
+        float envelope = 0.0f;
+        double timestampSec = 0.0;
+        bool triggered = false;
+        ParticipantId participantId = ParticipantId::None;
+    };
+
+    const BeatTimeline& beatTimeline() const { return beatTimelines_[0]; }
     float lastLimiterReductionDb() const { return limiterReductionDb_; }
     struct BeatMetrics {
         float bpm = 0.0f;
@@ -49,6 +60,8 @@ public:
     };
     BeatMetrics latestMetrics() const;
     std::vector<BeatEvent> pollBeatEvents();
+    ChannelMetrics channelMetrics(ParticipantId id) const;
+    std::vector<BeatEvent> pollBeatEvents(ParticipantId id);
     struct SignalHealth {
         float envelopeShort = 0.0f;
         float envelopeMid = 0.0f;
@@ -70,18 +83,19 @@ private:
     bool calibrationArmed_ = false;
     bool calibrationCompleted_ = false;
 
-    BeatTimeline beatTimeline_{};
+    std::array<BeatTimeline, 2> beatTimelines_{};
     SimpleLimiter limiter_{};
 
     mutable std::mutex mutex_;
-    std::vector<float> monoBuffer_;
+    std::array<std::vector<float>, 2> channelBuffers_;
     std::vector<float> outputScratch_;
     std::vector<float> noiseBuffer_;
     std::mt19937 rng_;
     std::normal_distribution<float> noiseDist_{0.0f, 1.0f};
     float inputGainLinear_ = 1.0f;
     BeatMetrics metrics_{};
-    std::deque<BeatEvent> pendingEvents_;
+    std::array<std::deque<BeatEvent>, 2> pendingEventsByChannel_;
+    std::array<ChannelMetrics, 2> channelMetrics_{};
     EnvelopeCalibrationStats lastEnvelopeCalibration_{};
     bool envelopeCalibrationActive_ = false;
     bool newEnvelopeCalibrationAvailable_ = false;
@@ -100,9 +114,11 @@ private:
     float fallbackBpm_ = 60.0f;
     double lastFallbackEmitSec_ = 0.0;
     SignalHealth signalHealth_{};
+    std::uint64_t legacySequenceCounter_ = 0;
 
     void applyCalibration(float& ch1, float& ch2) const;
     void ensureBufferSizes(std::size_t numFrames);
+    static std::optional<std::size_t> participantIndex(ParticipantId id);
 };
 
 } // namespace knot::audio

@@ -6,7 +6,12 @@
 namespace knot::audio {
 
 void BeatTimeline::setup(double sampleRate) {
+    setup(sampleRate, ParticipantId::None);
+}
+
+void BeatTimeline::setup(double sampleRate, ParticipantId participantId) {
     sampleRate_ = sampleRate;
+    participantId_ = participantId;
     bandPass1_.setup(BiquadFilter::Type::HighPass, sampleRate_, 20.0, 0.707);
     bandPass2_.setup(BiquadFilter::Type::LowPass, sampleRate_, 150.0, 0.707);
     envelopeFollower_.setup(sampleRate_, 5.0f, 60.0f);
@@ -21,6 +26,7 @@ void BeatTimeline::setup(double sampleRate) {
     lastEnvelope_ = 0.0f;
     currentBpm_ = 0.0f;
     events_.clear();
+    eventSequence_ = 0;
     noTriggerCounter_ = 0;
     noTriggerRelaxSamples_ = static_cast<std::size_t>(sampleRate_ * 3.0);
     minTriggerRatio_ = minTriggerRatioDefault_;
@@ -139,6 +145,8 @@ void BeatTimeline::processBuffer(const float* monoInput, std::size_t numFrames, 
             evt.timestampSec = triggerSample / sampleRate_;
             evt.bpm = currentBpm_;
             evt.envelope = env;
+            evt.participantId = participantId_;
+            evt.sequenceId = eventSequence_++;
             events_.push_back(evt);
             if (events_.size() > kMaxEvents) {
                 events_.pop_front();

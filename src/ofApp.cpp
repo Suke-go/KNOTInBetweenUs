@@ -146,6 +146,20 @@ void ofApp::setup() {
     audioPipeline_.setInputGainDb(appConfig_.inputGainDb);
     ofLogNotice("ofApp") << "Input gain set to " << appConfig_.inputGainDb << " dB";
     loadShaders();
+
+    bellSoundLoaded_ = bellSound_.load("audio/bell.wav");
+    if (bellSoundLoaded_) {
+        bellSound_.setVolume(0.6f);
+        bellSound_.setMultiPlay(false);
+        ofLogNotice("ofApp") << "Bell sound loaded: audio/bell.wav";
+    } else {
+        ofLogWarning("ofApp") << "Failed to load bell sound: audio/bell.wav";
+    }
+
+    audioFadeGain_ = 1.0f;
+    targetAudioFadeGain_ = 1.0f;
+    audioFading_ = false;
+
     initializeSessionSeed();
     calibrationSaved_ = audioPipeline_.calibrationReady();
     calibrationSaveAttempted_ = calibrationSaved_;
@@ -207,6 +221,23 @@ void ofApp::update() {
 
     sceneController_.update(nowSeconds);
     processSceneTransitionEvents();
+
+    // オーディオフェード処理
+    if (audioFading_) {
+        const double elapsed = nowSeconds - audioFadeStartTime_;
+        const double progress = std::clamp(elapsed / audioFadeDuration_, 0.0, 1.0);
+
+        // イーズイン・イーズアウト曲線
+        const float easedProgress = static_cast<float>(0.5 - 0.5 * std::cos(progress * M_PI));
+        audioFadeGain_ = audioFadeGain_ + (targetAudioFadeGain_ - audioFadeGain_) * easedProgress;
+
+        if (progress >= 1.0) {
+            audioFadeGain_ = targetAudioFadeGain_;
+            audioFading_ = false;
+            ofLogNotice("ofApp") << "Audio fade completed. Gain: " << audioFadeGain_;
+        }
+    }
+
     simulateTelemetry_ = simulateSignalParam_.get();
 
     if (audioPipeline_.isCalibrationActive()) {
@@ -417,6 +448,16 @@ void ofApp::audioIn(ofSoundBuffer& input) {
 
 void ofApp::audioOut(ofSoundBuffer& output) {
     audioPipeline_.audioOut(output);
+
+    // オーディオフェードゲインを適用
+    if (audioFadeGain_ < 0.99f) {
+        float* buffer = output.getBuffer().data();
+        const std::size_t numSamples = output.getNumFrames() * output.getNumChannels();
+
+        for (std::size_t i = 0; i < numSamples; ++i) {
+            buffer[i] *= audioFadeGain_;
+        }
+    }
 }
 
 void ofApp::onStartButtonPressed() {
@@ -848,6 +889,42 @@ void ofApp::handleTransitionEvent(const SceneController::TransitionEvent& event)
     record.timeInStateSec = event.timeInState;
     record.blendDurationSec = event.blendDuration;
     record.completed = event.completed;
+
+    // シーン遷移開始時の処理
+    if (!event.completed) {
+        // ベル音を鳴らす(Start→FirstPhase, FirstPhase→Exchange等の主要遷移)
+        if (bellSoundLoaded_) {
+            const bool playBell = (event.to == SceneState::FirstPhase) ||
+                                  (event.to == SceneState::Exchange) ||
+                                  (event.to == SceneState::Mixed) ||
+                                  (event.to == SceneState::End);
+            if (playBell) {
+                bellSound_.play();
+                ofLogNotice("ofApp") << "Bell sound played for transition: "
+                                      << sceneStateToString(event.from) << " → "
+                                      << sceneStateToString(event.to);
+            }
+        }
+
+        // オーディオフェードアウト開始(心音交換シーンへの遷移時)
+        if (event.to == SceneState::Exchange || event.to == SceneState::Mixed) {
+            audioFadeStartTime_ = event.timestamp;
+            targetAudioFadeGain_ = 0.1f;  // 10%まで減衰
+            audioFading_ = true;
+            ofLogNotice("ofApp") << "Audio fade-out started for scene transition";
+        }
+    }
+
+    // シーン遷移完了時の処理
+    if (event.completed) {
+        // オーディオフェードイン(Exchange/Mixed完了後)
+        if (event.to == SceneState::Exchange || event.to == SceneState::Mixed) {
+            audioFadeStartTime_ = event.timestamp;
+            targetAudioFadeGain_ = 1.0f;  // 100%に復帰
+            audioFading_ = true;
+            ofLogNotice("ofApp") << "Audio fade-in started after scene transition";
+        }
+    }
 
     if (!event.manual && sceneTimingConfig_) {
         if (const auto expected = sceneTimingConfig_->effectiveDuration(event.from)) {

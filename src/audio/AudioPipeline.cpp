@@ -5,6 +5,7 @@
 #include "ofMain.h"
 
 #include <algorithm>
+#include <array>
 
 namespace knot::audio {
 
@@ -19,10 +20,13 @@ void AudioPipeline::setup(double sampleRate, std::size_t bufferSize) {
     calibrationValues_[0] = {"CH1", 1.0f, 0.0f, 0};
     calibrationValues_[1] = {"CH2", 1.0f, 0.0f, 0};
     calibrationSession_.setup(sampleRate_, bufferSize_, 4);
-    beatTimeline_.setup(sampleRate_);
+    beatTimelines_[0].setup(sampleRate_, ParticipantId::Participant1);
+    beatTimelines_[1].setup(sampleRate_, ParticipantId::Participant2);
     limiter_.setup(sampleRate_, -3.0f, 80.0f);
     rng_.seed(std::random_device{}());
-    monoBuffer_.assign(bufferSize_, 0.0f);
+    for (auto& channelBuffer : channelBuffers_) {
+        channelBuffer.assign(bufferSize_, 0.0f);
+    }
     noiseBuffer_.assign(bufferSize_, 0.0f);
     outputScratch_.assign(bufferSize_ * 2, 0.0f);
     totalSamplesProcessed_ = 0.0;
@@ -42,6 +46,16 @@ void AudioPipeline::setup(double sampleRate, std::size_t bufferSize) {
     fallbackBpm_ = 60.0f;
     lastFallbackEmitSec_ = 0.0;
     signalHealth_ = {};
+    metrics_ = {};
+    for (auto& metrics : channelMetrics_) {
+        metrics = {};
+    }
+    channelMetrics_[0].participantId = ParticipantId::Participant1;
+    channelMetrics_[1].participantId = ParticipantId::Participant2;
+    for (auto& pending : pendingEventsByChannel_) {
+        pending.clear();
+    }
+    legacySequenceCounter_ = 0;
 }
 
 void AudioPipeline::setNoiseSeed(std::uint32_t seed) {
@@ -55,14 +69,16 @@ void AudioPipeline::setInputGainDb(float gainDb) {
 }
 
 void AudioPipeline::ensureBufferSizes(std::size_t numFrames) {
-    if (monoBuffer_.size() < numFrames) {
-        monoBuffer_.assign(numFrames, 0.0f);
+    for (auto& channelBuffer : channelBuffers_) {
+        if (channelBuffer.size() < numFrames) {
+            channelBuffer.assign(numFrames, 0.0f);
+        }
     }
     if (noiseBuffer_.size() < numFrames) {
         noiseBuffer_.assign(numFrames, 0.0f);
     }
-    if (outputScratch_.size() < numFrames * 2) {
-        outputScratch_.assign(numFrames * 2, 0.0f);
+    if (outputScratch_.size() < numFrames * 4) {
+        outputScratch_.assign(numFrames * 4, 0.0f);
     }
 }
 
@@ -87,9 +103,17 @@ void AudioPipeline::startCalibration() {
     calibrationArmed_ = true;
     calibrationCompleted_ = false;
     limiter_.reset();
-    beatTimeline_.setup(sampleRate_);
+    beatTimelines_[0].setup(sampleRate_, ParticipantId::Participant1);
+    beatTimelines_[1].setup(sampleRate_, ParticipantId::Participant2);
     metrics_ = {};
-    pendingEvents_.clear();
+    for (auto& channelMetric : channelMetrics_) {
+        channelMetric = {};
+    }
+    channelMetrics_[0].participantId = ParticipantId::Participant1;
+    channelMetrics_[1].participantId = ParticipantId::Participant2;
+    for (auto& pending : pendingEventsByChannel_) {
+        pending.clear();
+    }
     totalSamplesProcessed_ = 0.0;
     envelopeCalibrationActive_ = false;
     newEnvelopeCalibrationAvailable_ = false;
@@ -104,6 +128,7 @@ void AudioPipeline::startCalibration() {
     signalHealth_ = {};
     lastRealBeatSample_ = totalSamplesProcessed_;
     lastHealthUpdateSec_ = totalSamplesProcessed_ / sampleRate_;
+    legacySequenceCounter_ = 0;
 }
 
 bool AudioPipeline::isCalibrationActive() const {
@@ -121,8 +146,8 @@ void AudioPipeline::applyCalibration(float& ch1, float& ch2) const {
 
 void AudioPipeline::startEnvelopeCalibration(double durationSec) {
     std::lock_guard<std::mutex> lock(mutex_);
-    beatTimeline_.beginEnvelopeCalibration(durationSec);
-    envelopeCalibrationActive_ = beatTimeline_.isEnvelopeCalibrating();
+    beatTimelines_[0].beginEnvelopeCalibration(durationSec);
+    envelopeCalibrationActive_ = beatTimelines_[0].isEnvelopeCalibrating();
     newEnvelopeCalibrationAvailable_ = false;
 }
 
@@ -133,7 +158,7 @@ bool AudioPipeline::isEnvelopeCalibrationActive() const {
 
 float AudioPipeline::envelopeCalibrationProgress() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return beatTimeline_.calibrationProgress();
+    return beatTimelines_[0].calibrationProgress();
 }
 
 EnvelopeCalibrationStats AudioPipeline::lastEnvelopeCalibration() const {
@@ -166,7 +191,7 @@ void AudioPipeline::audioIn(const ofSoundBuffer& buffer) {
         totalSamplesProcessed_ += static_cast<double>(numFrames);
         signalHealth_ = {};
     } else {
-        const bool wasEnvelopeCalibrating = beatTimeline_.isEnvelopeCalibrating();
+        const bool wasEnvelopeCalibrating = beatTimelines_[0].isEnvelopeCalibrating();
         for (std::size_t frame = 0; frame < numFrames; ++frame) {
             float ch1 = input[frame * 2];
             float ch2 = input[frame * 2 + 1];
@@ -175,31 +200,50 @@ void AudioPipeline::audioIn(const ofSoundBuffer& buffer) {
                 ch2 = std::clamp(ch2 * inputGainLinear_, -1.0f, 1.0f);
             }
             applyCalibration(ch1, ch2);
-            monoBuffer_[frame] = 0.5f * (ch1 + ch2);
+            channelBuffers_[0][frame] = ch1;
+            channelBuffers_[1][frame] = ch2;
         }
         const double startSample = totalSamplesProcessed_;
-        beatTimeline_.processBuffer(monoBuffer_.data(), numFrames, startSample);
-        totalSamplesProcessed_ += static_cast<double>(numFrames);
-        metrics_.bpm = beatTimeline_.currentBpm();
-        metrics_.envelope = beatTimeline_.currentEnvelope();
-        metrics_.timestampSec = totalSamplesProcessed_ / sampleRate_;
-        metrics_.triggered = beatTimeline_.lastFrameTriggered();
-        if (metrics_.triggered) {
-            const auto& events = beatTimeline_.events();
-            if (!events.empty()) {
-                pendingEvents_.push_back(events.back());
-                if (pendingEvents_.size() > 128) {
-                    pendingEvents_.pop_front();
+        constexpr std::array<ParticipantId, 2> participants = {
+            ParticipantId::Participant1,
+            ParticipantId::Participant2};
+        for (std::size_t channel = 0; channel < beatTimelines_.size(); ++channel) {
+            beatTimelines_[channel].processBuffer(channelBuffers_[channel].data(), numFrames,
+                                                  startSample);
+            auto& channelMetric = channelMetrics_[channel];
+            const auto participantId = participants[channel];
+            channelMetric.bpm = beatTimelines_[channel].currentBpm();
+            channelMetric.envelope = beatTimelines_[channel].currentEnvelope();
+            channelMetric.timestampSec =
+                (totalSamplesProcessed_ + static_cast<double>(numFrames)) / sampleRate_;
+            channelMetric.triggered = beatTimelines_[channel].lastFrameTriggered();
+            channelMetric.participantId = participantId;
+
+            if (channelMetric.triggered) {
+                const auto& events = beatTimelines_[channel].events();
+                if (!events.empty()) {
+                    pendingEventsByChannel_[channel].push_back(events.back());
+                    if (pendingEventsByChannel_[channel].size() > 128) {
+                        pendingEventsByChannel_[channel].pop_front();
+                    }
                 }
             }
+        }
+        totalSamplesProcessed_ += static_cast<double>(numFrames);
+
+        metrics_.bpm = channelMetrics_[0].bpm;
+        metrics_.envelope = channelMetrics_[0].envelope;
+        metrics_.timestampSec = totalSamplesProcessed_ / sampleRate_;
+        metrics_.triggered = channelMetrics_[0].triggered;
+        if (metrics_.triggered) {
             if (metrics_.bpm > 1.0f) {
                 bpmAvg_ = bpmAvg_ + 0.25f * (metrics_.bpm - bpmAvg_);
             }
             lastRealBeatSample_ = totalSamplesProcessed_;
         }
-        const bool isEnvelopeCalibrating = beatTimeline_.isEnvelopeCalibrating();
+        const bool isEnvelopeCalibrating = beatTimelines_[0].isEnvelopeCalibrating();
         if (wasEnvelopeCalibrating && !isEnvelopeCalibrating) {
-            lastEnvelopeCalibration_ = beatTimeline_.calibrationStats();
+            lastEnvelopeCalibration_ = beatTimelines_[0].calibrationStats();
             envelopeCalibrationActive_ = false;
             newEnvelopeCalibrationAvailable_ = true;
         } else {
@@ -246,9 +290,11 @@ void AudioPipeline::audioIn(const ofSoundBuffer& buffer) {
                     evt.timestampSec = lastFallbackEmitSec_;
                     evt.bpm = fallbackBpm_;
                     evt.envelope = fallbackEnvelope_;
-                    pendingEvents_.push_back(evt);
-                    if (pendingEvents_.size() > 128) {
-                        pendingEvents_.pop_front();
+                    evt.participantId = ParticipantId::Participant1;
+                    evt.sequenceId = legacySequenceCounter_++;
+                    pendingEventsByChannel_[0].push_back(evt);
+                    if (pendingEventsByChannel_[0].size() > 128) {
+                        pendingEventsByChannel_[0].pop_front();
                     }
                 }
             }
@@ -282,10 +328,18 @@ void AudioPipeline::audioOut(ofSoundBuffer& buffer) {
             calibrationArmed_ = false;
             calibrationCompleted_ = true;
             limiter_.reset();
-            beatTimeline_.setup(sampleRate_);
+            beatTimelines_[0].setup(sampleRate_, ParticipantId::Participant1);
+            beatTimelines_[1].setup(sampleRate_, ParticipantId::Participant2);
             totalSamplesProcessed_ = 0.0;
             metrics_ = {};
-            pendingEvents_.clear();
+            for (auto& pending : pendingEventsByChannel_) {
+                pending.clear();
+            }
+            for (auto& metric : channelMetrics_) {
+                metric = {};
+            }
+            channelMetrics_[0].participantId = ParticipantId::Participant1;
+            channelMetrics_[1].participantId = ParticipantId::Participant2;
         }
         return;
     }
@@ -298,12 +352,14 @@ void AudioPipeline::audioOut(ofSoundBuffer& buffer) {
     }
 
     for (std::size_t frame = 0; frame < numFrames; ++frame) {
-        const float heartbeat = frame < monoBuffer_.size() ? monoBuffer_[frame] : 0.0f;
-        const float selfSample = heartbeat * selfGain;
+        const float heartbeatP1 =
+            frame < channelBuffers_[0].size() ? channelBuffers_[0][frame] : 0.0f;
+        const float heartbeatP2 =
+            frame < channelBuffers_[1].size() ? channelBuffers_[1][frame] : 0.0f;
         const float noise = noiseBuffer_[frame] * noiseGain;
 
-        float left = selfSample + noise;
-        float right = selfSample + noise;
+        float left = heartbeatP1 * selfGain + noise;
+        float right = heartbeatP2 * selfGain + noise;
 
         const float detectionSample = (std::fabs(left) >= std::fabs(right)) ? left : right;
         limiter_.process(detectionSample);
@@ -330,9 +386,53 @@ AudioPipeline::BeatMetrics AudioPipeline::latestMetrics() const {
 
 std::vector<BeatEvent> AudioPipeline::pollBeatEvents() {
     std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<BeatEvent> events(pendingEvents_.begin(), pendingEvents_.end());
-    pendingEvents_.clear();
+    const std::size_t totalSize =
+        pendingEventsByChannel_[0].size() + pendingEventsByChannel_[1].size();
+    std::vector<BeatEvent> events;
+    events.reserve(totalSize);
+    for (auto& pending : pendingEventsByChannel_) {
+        events.insert(events.end(), pending.begin(), pending.end());
+        pending.clear();
+    }
+    std::stable_sort(events.begin(), events.end(), [](const BeatEvent& a, const BeatEvent& b) {
+        if (a.timestampSec == b.timestampSec) {
+            return a.sequenceId < b.sequenceId;
+        }
+        return a.timestampSec < b.timestampSec;
+    });
     return events;
+}
+
+AudioPipeline::ChannelMetrics AudioPipeline::channelMetrics(ParticipantId id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto idx = participantIndex(id);
+    if (!idx) {
+        return {};
+    }
+    return channelMetrics_[*idx];
+}
+
+std::vector<BeatEvent> AudioPipeline::pollBeatEvents(ParticipantId id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto idx = participantIndex(id);
+    if (!idx) {
+        return {};
+    }
+    std::vector<BeatEvent> events(pendingEventsByChannel_[*idx].begin(),
+                                  pendingEventsByChannel_[*idx].end());
+    pendingEventsByChannel_[*idx].clear();
+    return events;
+}
+
+std::optional<std::size_t> AudioPipeline::participantIndex(ParticipantId id) {
+    switch (id) {
+        case ParticipantId::Participant1:
+            return 0;
+        case ParticipantId::Participant2:
+            return 1;
+        default:
+            return std::nullopt;
+    }
 }
 
 } // namespace knot::audio

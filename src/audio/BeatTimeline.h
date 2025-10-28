@@ -2,7 +2,9 @@
 
 #include "BiquadFilter.h"
 #include "EnvelopeFollower.h"
+#include "ParticipantId.h"
 
+#include <cstdint>
 #include <deque>
 #include <optional>
 #include <vector>
@@ -13,6 +15,8 @@ struct BeatEvent {
     double timestampSec = 0.0;
     float bpm = 0.0f;
     float envelope = 0.0f;
+    ParticipantId participantId = ParticipantId::None;
+    std::uint64_t sequenceId = 0;
 };
 
 struct EnvelopeCalibrationStats {
@@ -27,6 +31,7 @@ struct EnvelopeCalibrationStats {
 class BeatTimeline {
 public:
     void setup(double sampleRate);
+    void setup(double sampleRate, ParticipantId participantId);
 
     void processBuffer(const float* monoInput, std::size_t numFrames, double startSampleIndex);
 
@@ -42,9 +47,11 @@ public:
 
 private:
     double sampleRate_ = 48000.0;
+    ParticipantId participantId_ = ParticipantId::None;
     BiquadFilter bandPass1_;
     BiquadFilter bandPass2_;
     EnvelopeFollower envelopeFollower_;
+    std::uint64_t eventSequence_ = 0;
 
     float adaptiveThreshold_ = 0.0f;
     float thresholdHoldMs_ = 120.0f;
