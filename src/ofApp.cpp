@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <deque>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -42,6 +43,18 @@ ofMesh& fullscreenQuadMesh() {
         mesh.addVertex(glm::vec3(1.0f, 1.0f, 0.0f));
     }
     return mesh;
+}
+
+std::optional<std::size_t> participantIndex(knot::audio::ParticipantId id) {
+    using knot::audio::ParticipantId;
+    switch (id) {
+        case ParticipantId::Participant1:
+            return 0;
+        case ParticipantId::Participant2:
+            return 1;
+        default:
+            return std::nullopt;
+    }
 }
 
 }  // namespace
@@ -105,6 +118,9 @@ void ofApp::setup() {
     sceneController_.setTimingConfig(sceneTimingConfig_);
     sceneController_.setup(nowSeconds, 1.2);
     envelopeHistory_.setHorizon(30.0);
+    for (auto& history : participantEnvelopeHistory_) {
+        history.setHorizon(30.0);
+    }
     latestMetrics_ = {};
 
     controlPanel_.setup("Session Control");
@@ -112,6 +128,10 @@ void ofApp::setup() {
     controlPanel_.add(sceneParam_.set("Scene", sceneStateToString(SceneState::Idle)));
     controlPanel_.add(bpmParam_.set("BPM", 0.0f, 0.0f, 240.0f));
     controlPanel_.add(envelopeParam_.set("Envelope", 0.0f, 0.0f, 1.0f));
+    controlPanel_.add(bpmP1Param_.set("BPM P1", 0.0f, 0.0f, 240.0f));
+    controlPanel_.add(bpmP2Param_.set("BPM P2", 0.0f, 0.0f, 240.0f));
+    controlPanel_.add(envelopeP1Param_.set("Env P1", 0.0f, 0.0f, 1.0f));
+    controlPanel_.add(envelopeP2Param_.set("Env P2", 0.0f, 0.0f, 1.0f));
     controlPanel_.add(hapticCountParam_.set("Haptic Count", 0U, 0U, 4096U));
     simulateTelemetry_ = appConfig_.enableSyntheticTelemetry;
     controlPanel_.add(simulateSignalParam_.set("Synthetic Signal", simulateTelemetry_));
@@ -119,11 +139,25 @@ void ofApp::setup() {
     controlPanel_.add(endButton_.setup("Trigger End"));
     controlPanel_.add(resetButton_.setup("Reset to Idle"));
     controlPanel_.add(envelopeCalibrationButton_.setup("Envelope Baseline 計測"));
+    controlPanel_.add(refreshDevicesButton_.setup("Refresh Audio Devices"));
+    controlPanel_.add(prevInputDeviceButton_.setup("< Input Device"));
+    controlPanel_.add(nextInputDeviceButton_.setup("Input Device >"));
+    controlPanel_.add(prevOutputDeviceButton_.setup("< Output Device"));
+    controlPanel_.add(nextOutputDeviceButton_.setup("Output Device >"));
+    controlPanel_.add(applyAudioDevicesButton_.setup("Apply Audio Device Selection"));
+    controlPanel_.add(inputDeviceLabel_.set("Input Device", "未選択"));
+    controlPanel_.add(outputDeviceLabel_.set("Output Device", "未選択"));
 
     startButton_.addListener(this, &ofApp::onStartButtonPressed);
     endButton_.addListener(this, &ofApp::onEndButtonPressed);
     resetButton_.addListener(this, &ofApp::onResetButtonPressed);
     envelopeCalibrationButton_.addListener(this, &ofApp::onEnvelopeCalibrationButtonPressed);
+    refreshDevicesButton_.addListener(this, &ofApp::onRefreshAudioDevices);
+    prevInputDeviceButton_.addListener(this, &ofApp::onPrevInputDevice);
+    nextInputDeviceButton_.addListener(this, &ofApp::onNextInputDevice);
+    prevOutputDeviceButton_.addListener(this, &ofApp::onPrevOutputDevice);
+    nextOutputDeviceButton_.addListener(this, &ofApp::onNextOutputDevice);
+    applyAudioDevicesButton_.addListener(this, &ofApp::onApplyAudioDevices);
 
     statusPanel_.setup("Monitor");
     statusPanel_.setPosition(controlPanel_.getPosition().x,
@@ -145,6 +179,10 @@ void ofApp::setup() {
     audioPipeline_.loadCalibrationFile(calibrationFilePath_);
     audioPipeline_.setInputGainDb(appConfig_.inputGainDb);
     ofLogNotice("ofApp") << "Input gain set to " << appConfig_.inputGainDb << " dB";
+    audioRouter_.setup(static_cast<float>(sampleRate_));
+    audioRouter_.applyScenePreset(sceneController_.currentState());
+    ofLogNotice("ofApp") << "AudioRouter initialised with scene preset: "
+                         << sceneStateToString(sceneController_.currentState());
     loadShaders();
 
     bellSoundLoaded_ = bellSound_.load("audio/bell.wav");
@@ -166,21 +204,8 @@ void ofApp::setup() {
     calibrationReportAppended_ = false;
     const bool pendingAutoCalibration = !calibrationSaved_;
 
-    ofSoundStreamSettings settings;
-    settings.sampleRate = static_cast<unsigned int>(sampleRate_);
-    settings.numInputChannels = 2;
-    settings.numOutputChannels = 2;
-    settings.bufferSize = bufferSize_;
-    settings.setInListener(this);
-    settings.setOutListener(this);
-
-    try {
-        soundStream_.setup(settings);
-        soundStream_.start();
-        soundStreamActive_ = true;
-    } catch (const std::exception& ex) {
-        ofLogError("ofApp") << "Failed to initialise sound stream: " << ex.what();
-        soundStreamActive_ = false;
+    refreshAudioDeviceList();
+    if (!setupSoundStreamWithSelection()) {
         simulateSignalParam_.set(true);
         simulateTelemetry_ = true;
     }
@@ -202,7 +227,7 @@ void ofApp::setup() {
     sessionStartMicros_ = ofGetElapsedTimeMicros();
     lastTelemetryMicros_ = sessionStartMicros_;
     lastEnvelopeSampledAt_ = 0.0;
-    lastSimulatedBeatAt_ = 0.0;
+    lastSimulatedBeatAt_.fill(0.0);
     beatCounter_ = 0;
     limiterReductionDbSmooth_ = 0.0f;
     lastStrongSignalAt_ = nowSeconds;
@@ -273,15 +298,28 @@ void ofApp::update() {
         updateFakeSignal(nowSeconds);
         limiterReductionDbSmooth_ = ofLerp(limiterReductionDbSmooth_, 0.0f, 0.15f);
     } else {
-        const auto metrics = audioPipeline_.latestMetrics();
+        const auto metricsP1 =
+            audioPipeline_.channelMetrics(knot::audio::ParticipantId::Participant1);
+        const auto metricsP2 =
+            audioPipeline_.channelMetrics(knot::audio::ParticipantId::Participant2);
         const bool metricsAvailable =
-            (metrics.timestampSec > 0.0) || (metrics.envelope > 0.0f) || (metrics.bpm > 0.0f);
+            (metricsP1.timestampSec > 0.0) || (metricsP2.timestampSec > 0.0) ||
+            (metricsP1.envelope > 0.0f) || (metricsP2.envelope > 0.0f);
         if (metricsAvailable) {
-            applyBeatMetrics(metrics, nowSeconds);
-            const auto events = audioPipeline_.pollBeatEvents();
-            if (!events.empty()) {
-                handleBeatEvents(events, nowSeconds);
+            applyBeatMetrics(knot::audio::ParticipantId::Participant1, metricsP1, nowSeconds);
+            applyBeatMetrics(knot::audio::ParticipantId::Participant2, metricsP2, nowSeconds);
+
+            const auto eventsP1 =
+                audioPipeline_.pollBeatEvents(knot::audio::ParticipantId::Participant1);
+            if (!eventsP1.empty()) {
+                handleBeatEvents(knot::audio::ParticipantId::Participant1, eventsP1, nowSeconds);
             }
+            const auto eventsP2 =
+                audioPipeline_.pollBeatEvents(knot::audio::ParticipantId::Participant2);
+            if (!eventsP2.empty()) {
+                handleBeatEvents(knot::audio::ParticipantId::Participant2, eventsP2, nowSeconds);
+            }
+
             limiterReductionDbSmooth_ =
                 ofLerp(limiterReductionDbSmooth_, audioPipeline_.lastLimiterReductionDb(), 0.18f);
         } else {
@@ -291,12 +329,17 @@ void ofApp::update() {
         signalHealth_ = audioPipeline_.signalHealth();
     }
 
+    latestMetrics_.timestampSec = nowSeconds;
+    latestMetrics_.bpm = 0.5f * (participantBpms_[0] + participantBpms_[1]);
+    latestMetrics_.envelope =
+        std::clamp(0.5f * (participantEnvelopes_[0] + participantEnvelopes_[1]), 0.0f, 1.0f);
+    signalHealth_.fallbackEnvelope = latestMetrics_.envelope;
+    displayEnvelope_ = std::clamp(blendedEnvelope(), 0.0f, 1.0f);
+
     if (!signalHealth_.fallbackActive && useSynthetic) {
         signalHealth_.fallbackBlend = 0.0f;
     }
-    displayEnvelope_ = blendedEnvelope();
-    latestMetrics_.envelope = displayEnvelope_;
-    updateEnvelopeHistory(nowSeconds, displayEnvelope_);
+    updateEnvelopeHistories(nowSeconds);
 
     if (lastFallbackActive_ != signalHealth_.fallbackActive) {
         if (signalHealth_.fallbackActive) {
@@ -358,16 +401,14 @@ void ofApp::exit() {
     endButton_.removeListener(this, &ofApp::onEndButtonPressed);
     resetButton_.removeListener(this, &ofApp::onResetButtonPressed);
     envelopeCalibrationButton_.removeListener(this, &ofApp::onEnvelopeCalibrationButtonPressed);
+    refreshDevicesButton_.removeListener(this, &ofApp::onRefreshAudioDevices);
+    prevInputDeviceButton_.removeListener(this, &ofApp::onPrevInputDevice);
+    nextInputDeviceButton_.removeListener(this, &ofApp::onNextInputDevice);
+    prevOutputDeviceButton_.removeListener(this, &ofApp::onPrevOutputDevice);
+    nextOutputDeviceButton_.removeListener(this, &ofApp::onNextOutputDevice);
+    applyAudioDevicesButton_.removeListener(this, &ofApp::onApplyAudioDevices);
 
-    if (soundStreamActive_) {
-        try {
-            soundStream_.stop();
-            soundStream_.close();
-        } catch (const std::exception& ex) {
-            ofLogError("ofApp") << "Sound stream shutdown failed: " << ex.what();
-        }
-        soundStreamActive_ = false;
-    }
+    shutdownSoundStream();
 
     if (sessionLogger_) {
         sessionLogger_->writeSummary();
@@ -447,15 +488,48 @@ void ofApp::audioIn(ofSoundBuffer& input) {
 }
 
 void ofApp::audioOut(ofSoundBuffer& output) {
-    audioPipeline_.audioOut(output);
+    const std::size_t numFrames = output.getNumFrames();
+    const std::size_t numChannels = output.getNumChannels();
+    if (numFrames == 0 || numChannels == 0) {
+        return;
+    }
 
-    // オーディオフェードゲインを適用
+    if (stereoScratch_.getNumFrames() != numFrames || stereoScratch_.getNumChannels() != 2) {
+        stereoScratch_.allocate(numFrames, 2);
+    }
+    stereoScratch_.setSampleRate(output.getSampleRate());
+
+    audioPipeline_.audioOut(stereoScratch_);
+
+    const auto metricsP1 = audioPipeline_.channelMetrics(knot::audio::ParticipantId::Participant1);
+    const auto metricsP2 = audioPipeline_.channelMetrics(knot::audio::ParticipantId::Participant2);
+    envelopeFrame_[0] = std::clamp(metricsP1.envelope, 0.0f, 1.0f);
+    envelopeFrame_[1] = std::clamp(metricsP2.envelope, 0.0f, 1.0f);
+
+    const float* stereoData = stereoScratch_.getBuffer().data();
+    float* outputData = output.getBuffer().data();
+
+    for (std::size_t frame = 0; frame < numFrames; ++frame) {
+        headphoneFrame_[0] = stereoData[frame * 2];
+        headphoneFrame_[1] = stereoData[frame * 2 + 1];
+
+        audioRouter_.route(headphoneFrame_, envelopeFrame_, routedFrame_);
+
+        if (numChannels >= 4) {
+            outputData[frame * numChannels + 0] = routedFrame_[0];
+            outputData[frame * numChannels + 1] = routedFrame_[1];
+            outputData[frame * numChannels + 2] = routedFrame_[2];
+            outputData[frame * numChannels + 3] = routedFrame_[3];
+        } else if (numChannels >= 2) {
+            outputData[frame * numChannels + 0] = routedFrame_[0];
+            outputData[frame * numChannels + 1] = routedFrame_[1];
+        }
+    }
+
     if (audioFadeGain_ < 0.99f) {
-        float* buffer = output.getBuffer().data();
-        const std::size_t numSamples = output.getNumFrames() * output.getNumChannels();
-
-        for (std::size_t i = 0; i < numSamples; ++i) {
-            buffer[i] *= audioFadeGain_;
+        const std::size_t totalSamples = numFrames * numChannels;
+        for (std::size_t i = 0; i < totalSamples; ++i) {
+            outputData[i] *= audioFadeGain_;
         }
     }
 }
@@ -534,6 +608,10 @@ void ofApp::updateSceneGui(double nowSeconds) {
 
     bpmParam_.set(latestMetrics_.bpm);
     envelopeParam_.set(latestMetrics_.envelope);
+    bpmP1Param_.set(participantBpms_[0]);
+    bpmP2Param_.set(participantBpms_[1]);
+    envelopeP1Param_.set(participantEnvelopes_[0]);
+    envelopeP2Param_.set(participantEnvelopes_[1]);
     hapticCountParam_.set(static_cast<std::uint32_t>(hapticLog_.entries().size()));
 
     const double horizon = std::clamp(sceneController_.timeInState(nowSeconds) * 1.2, 10.0, 45.0);
@@ -556,53 +634,86 @@ void ofApp::updateSceneGui(double nowSeconds) {
     guidanceParam_.set(buildGuidanceMessage(nowSeconds));
 }
 
-void ofApp::updateEnvelopeHistory(double nowSeconds, float envelopeValue) {
+void ofApp::updateEnvelopeHistories(double nowSeconds) {
     if (nowSeconds - lastEnvelopeSampledAt_ < kEnvelopeSampleIntervalSec) {
         return;
     }
     lastEnvelopeSampledAt_ = nowSeconds;
-    envelopeHistory_.addSample(nowSeconds, envelopeValue, latestMetrics_.bpm);
+    for (std::size_t idx = 0; idx < participantEnvelopeHistory_.size(); ++idx) {
+        participantEnvelopeHistory_[idx].addSample(nowSeconds, participantEnvelopes_[idx], participantBpms_[idx]);
+    }
+    envelopeHistory_.addSample(nowSeconds, displayEnvelope_, latestMetrics_.bpm);
 }
 
 void ofApp::updateFakeSignal(double nowSeconds) {
-    const double phase = nowSeconds * 0.5;
-    const float bpm = 64.0f + 6.0f * static_cast<float>(std::sin(phase * 0.6));
-    const float env = ofClamp(0.52f + 0.42f * static_cast<float>(std::sin(phase)), 0.0f, 1.0f);
+    const std::array<double, 2> phases{
+        nowSeconds * 0.45,
+        nowSeconds * 0.58 + 1.1};
+    const std::array<float, 2> bpms{
+        64.0f + 6.0f * static_cast<float>(std::sin(phases[0] * 0.7)),
+        70.0f + 5.0f * static_cast<float>(std::cos(phases[1] * 0.5))};
+    const std::array<float, 2> envelopes{
+        ofClamp(0.5f + 0.45f * static_cast<float>(std::sin(phases[0])), 0.0f, 1.0f),
+        ofClamp(0.48f + 0.46f * static_cast<float>(std::sin(phases[1] + 0.6)), 0.0f, 1.0f)};
 
-    latestMetrics_.timestampSec = nowSeconds;
-    latestMetrics_.bpm = bpm;
-    latestMetrics_.envelope = env;
+    for (std::size_t idx = 0; idx < 2; ++idx) {
+        participantMetrics_[idx].timestampSec = nowSeconds;
+        participantMetrics_[idx].bpm = bpms[idx];
+        participantMetrics_[idx].envelope = envelopes[idx];
+        participantBpms_[idx] = bpms[idx];
+        participantEnvelopes_[idx] = envelopes[idx];
 
-    const double beatIntervalSec = 60.0 / std::max(35.0f, bpm);
-    if (nowSeconds - lastSimulatedBeatAt_ >= beatIntervalSec) {
-        lastSimulatedBeatAt_ = nowSeconds;
-        appendHapticEvent(nowSeconds, ofClamp(0.4f + 0.5f * static_cast<float>(std::sin(phase * 1.3)), 0.0f, 1.0f),
-                          "synthetic");
+        const double beatIntervalSec = 60.0 / std::max(35.0f, bpms[idx]);
+        if (nowSeconds - lastSimulatedBeatAt_[idx] >= beatIntervalSec) {
+            lastSimulatedBeatAt_[idx] = nowSeconds;
+            const float intensity =
+                ofClamp(0.4f + 0.5f * static_cast<float>(std::sin(phases[idx] * 1.3)), 0.0f, 1.0f);
+            const std::string label = idx == 0 ? "P1_synthetic" : "P2_synthetic";
+            appendHapticEvent(nowSeconds, intensity, label);
+        }
     }
 
-    signalHealth_.envelopeShort = env;
-    signalHealth_.envelopeMid = env;
-    signalHealth_.envelopeLong = env;
-    signalHealth_.bpmAverage = bpm;
+    latestMetrics_.timestampSec = nowSeconds;
+    latestMetrics_.bpm = 0.5f * (bpms[0] + bpms[1]);
+    latestMetrics_.envelope = 0.5f * (envelopes[0] + envelopes[1]);
+
+    signalHealth_.envelopeShort = latestMetrics_.envelope;
+    signalHealth_.envelopeMid = latestMetrics_.envelope;
+    signalHealth_.envelopeLong = latestMetrics_.envelope;
+    signalHealth_.bpmAverage = latestMetrics_.bpm;
     signalHealth_.dropoutSeconds = 0.0f;
     signalHealth_.fallbackActive = false;
     signalHealth_.fallbackBlend = 0.0f;
-    signalHealth_.fallbackEnvelope = env;
+    signalHealth_.fallbackEnvelope = latestMetrics_.envelope;
 }
 
-void ofApp::applyBeatMetrics(const knot::audio::AudioPipeline::BeatMetrics& metrics, double nowSeconds) {
-    latestMetrics_.timestampSec = nowSeconds;
-    latestMetrics_.bpm = metrics.bpm;
-    latestMetrics_.envelope = metrics.envelope;
+void ofApp::applyBeatMetrics(knot::audio::ParticipantId participant,
+                             const knot::audio::AudioPipeline::ChannelMetrics& metrics, double nowSeconds) {
+    const auto idx = participantIndex(participant);
+    if (!idx) {
+        return;
+    }
+    participantMetrics_[*idx].timestampSec = nowSeconds;
+    participantMetrics_[*idx].bpm = metrics.bpm;
+    participantMetrics_[*idx].envelope = metrics.envelope;
+    participantEnvelopes_[*idx] = std::clamp(metrics.envelope, 0.0f, 1.0f);
+    participantBpms_[*idx] = std::max(0.0f, metrics.bpm);
 }
 
-void ofApp::handleBeatEvents(const std::vector<knot::audio::BeatEvent>& events, double nowSeconds) {
+void ofApp::handleBeatEvents(knot::audio::ParticipantId participant,
+                             const std::vector<knot::audio::BeatEvent>& events, double nowSeconds) {
+    const auto idx = participantIndex(participant);
+    if (!idx) {
+        return;
+    }
     for (const auto& evt : events) {
         if (evt.bpm > 1.0f) {
-            latestMetrics_.bpm = evt.bpm;
+            participantBpms_[*idx] = evt.bpm;
+            participantMetrics_[*idx].bpm = evt.bpm;
         }
         const float intensity = ofClamp(evt.envelope, 0.2f, 1.0f);
-        const std::string label = signalHealth_.fallbackActive ? "fallback" : "detected";
+        const std::string labelPrefix = (participant == knot::audio::ParticipantId::Participant1) ? "P1" : "P2";
+        const std::string label = signalHealth_.fallbackActive ? labelPrefix + "_fallback" : labelPrefix + "_detected";
         appendHapticEvent(nowSeconds, intensity, label);
     }
 }
@@ -732,36 +843,251 @@ void ofApp::loadShaders() {
     loadShaderFn(rippleShader_, rippleShaderLoaded_, "shaders/ripple.vert", "shaders/ripple.frag");
 }
 
-void ofApp::drawStarfieldLayer(float alpha, double nowSeconds, float envelope) {
+void ofApp::drawStarfieldLayer(float alpha, double nowSeconds, float envelopeP1, float envelopeP2) {
     if (!starfieldShaderLoaded_) {
         return;
     }
     const float clampedAlpha = std::clamp(alpha, 0.0f, 1.0f);
-    const float env = std::clamp(envelope, 0.0f, 1.0f);
+    const float env1 = std::clamp(envelopeP1, 0.0f, 1.0f);
+    const float env2 = std::clamp(envelopeP2, 0.0f, 1.0f);
     ofFill();
     starfieldShader_.begin();
     starfieldShader_.setUniform2f("uResolution", static_cast<float>(ofGetWidth()), static_cast<float>(ofGetHeight()));
     starfieldShader_.setUniform1f("uTime", static_cast<float>(nowSeconds));
-    starfieldShader_.setUniform1f("uEnvelope", env);
+    starfieldShader_.setUniform2f("uEnvelopes", env1, env2);
     starfieldShader_.setUniform1f("uAlpha", clampedAlpha);
     fullscreenQuadMesh().draw();
     starfieldShader_.end();
 }
 
-void ofApp::drawRippleLayer(float alpha, double nowSeconds, float envelope) {
+void ofApp::drawRippleLayer(float alpha, double nowSeconds, float envelopeP1, float envelopeP2) {
     if (!rippleShaderLoaded_) {
         return;
     }
     const float clampedAlpha = std::clamp(alpha, 0.0f, 1.0f);
-    const float env = std::clamp(envelope, 0.0f, 1.0f);
+    const float env1 = std::clamp(envelopeP1, 0.0f, 1.0f);
+    const float env2 = std::clamp(envelopeP2, 0.0f, 1.0f);
     ofFill();
     rippleShader_.begin();
     rippleShader_.setUniform2f("uResolution", static_cast<float>(ofGetWidth()), static_cast<float>(ofGetHeight()));
     rippleShader_.setUniform1f("uTime", static_cast<float>(nowSeconds));
-    rippleShader_.setUniform1f("uEnvelope", env);
+    rippleShader_.setUniform2f("uEnvelopes", env1, env2);
     rippleShader_.setUniform1f("uAlpha", clampedAlpha);
     fullscreenQuadMesh().draw();
     rippleShader_.end();
+}
+
+void ofApp::refreshAudioDeviceList() {
+    const int currentInputId =
+        (selectedInputDevice_ >= 0 && selectedInputDevice_ < static_cast<int>(inputDevices_.size()))
+            ? inputDevices_[selectedInputDevice_].deviceID
+            : -1;
+    const int currentOutputId =
+        (selectedOutputDevice_ >= 0 && selectedOutputDevice_ < static_cast<int>(outputDevices_.size()))
+            ? outputDevices_[selectedOutputDevice_].deviceID
+            : -1;
+
+    inputDevices_.clear();
+    outputDevices_.clear();
+
+    const auto devices = ofSoundStreamListDevices();
+    for (const auto& device : devices) {
+        if (device.inputChannels > 0) {
+            inputDevices_.push_back(device);
+        }
+        if (device.outputChannels > 0) {
+            outputDevices_.push_back(device);
+        }
+    }
+
+    auto resolveSelection = [](const std::vector<ofSoundDevice>& devices, int desiredId, bool preferInput) {
+        if (devices.empty()) {
+            return -1;
+        }
+        if (desiredId != -1) {
+            for (std::size_t i = 0; i < devices.size(); ++i) {
+                if (devices[i].deviceID == desiredId) {
+                    return static_cast<int>(i);
+                }
+            }
+        }
+        for (std::size_t i = 0; i < devices.size(); ++i) {
+            if (preferInput && devices[i].isDefaultInput) {
+                return static_cast<int>(i);
+            }
+            if (!preferInput && devices[i].isDefaultOutput) {
+                return static_cast<int>(i);
+            }
+        }
+        return 0;
+    };
+
+    selectedInputDevice_ = resolveSelection(inputDevices_, currentInputId, true);
+    selectedOutputDevice_ = resolveSelection(outputDevices_, currentOutputId, false);
+
+    updateAudioDeviceLabels();
+}
+
+void ofApp::updateAudioDeviceLabels() {
+    if (inputDevices_.empty()) {
+        inputDeviceLabel_.set("Input Device", "入力デバイス未検出");
+    } else if (selectedInputDevice_ >= 0 &&
+               selectedInputDevice_ < static_cast<int>(inputDevices_.size())) {
+        const auto& device = inputDevices_[selectedInputDevice_];
+        const std::string label = device.name + " (ID " + ofToString(device.deviceID) + ", " +
+                                  ofToString(device.inputChannels) + "ch)";
+        inputDeviceLabel_.set("Input Device", label);
+    } else {
+        inputDeviceLabel_.set("Input Device", "入力デバイス未選択");
+    }
+
+    if (outputDevices_.empty()) {
+        outputDeviceLabel_.set("Output Device", "出力デバイス未検出");
+    } else if (selectedOutputDevice_ >= 0 &&
+               selectedOutputDevice_ < static_cast<int>(outputDevices_.size())) {
+        const auto& device = outputDevices_[selectedOutputDevice_];
+        std::string label = device.name + " (ID " + ofToString(device.deviceID) + ", " +
+                            ofToString(device.outputChannels) + "ch)";
+        if (device.outputChannels < 4) {
+            label += " ※4ch未対応";
+        }
+        outputDeviceLabel_.set("Output Device", label);
+    } else {
+        outputDeviceLabel_.set("Output Device", "出力デバイス未選択");
+    }
+}
+
+void ofApp::selectNextInputDevice(int delta) {
+    if (inputDevices_.empty()) {
+        return;
+    }
+    if (selectedInputDevice_ < 0) {
+        selectedInputDevice_ = 0;
+    }
+    const int size = static_cast<int>(inputDevices_.size());
+    selectedInputDevice_ = (selectedInputDevice_ + delta + size) % size;
+    updateAudioDeviceLabels();
+}
+
+void ofApp::selectNextOutputDevice(int delta) {
+    if (outputDevices_.empty()) {
+        return;
+    }
+    if (selectedOutputDevice_ < 0) {
+        selectedOutputDevice_ = 0;
+    }
+    const int size = static_cast<int>(outputDevices_.size());
+    selectedOutputDevice_ = (selectedOutputDevice_ + delta + size) % size;
+    updateAudioDeviceLabels();
+}
+
+void ofApp::onRefreshAudioDevices() {
+    refreshAudioDeviceList();
+}
+
+void ofApp::onPrevInputDevice() {
+    selectNextInputDevice(-1);
+}
+
+void ofApp::onNextInputDevice() {
+    selectNextInputDevice(1);
+}
+
+void ofApp::onPrevOutputDevice() {
+    selectNextOutputDevice(-1);
+}
+
+void ofApp::onNextOutputDevice() {
+    selectNextOutputDevice(1);
+}
+
+void ofApp::onApplyAudioDevices() {
+    if (setupSoundStreamWithSelection()) {
+        simulateTelemetry_ = simulateSignalParam_.get();
+    } else {
+        simulateSignalParam_.set(true);
+        simulateTelemetry_ = true;
+    }
+}
+
+void ofApp::shutdownSoundStream() {
+    if (!soundStreamActive_) {
+        return;
+    }
+    try {
+        soundStream_.stop();
+        soundStream_.close();
+    } catch (const std::exception& ex) {
+        ofLogError("ofApp") << "Sound stream shutdown failed: " << ex.what();
+    }
+    soundStreamActive_ = false;
+}
+
+bool ofApp::setupSoundStreamWithSelection() {
+    if (outputDevices_.empty()) {
+        ofLogError("ofApp") << "出力デバイスが検出できません。";
+        shutdownSoundStream();
+        return false;
+    }
+
+    if (selectedOutputDevice_ < 0 || selectedOutputDevice_ >= static_cast<int>(outputDevices_.size())) {
+        selectedOutputDevice_ = std::min<int>(0, static_cast<int>(outputDevices_.size()) - 1);
+    }
+    if (selectedInputDevice_ < 0 || selectedInputDevice_ >= static_cast<int>(inputDevices_.size())) {
+        selectedInputDevice_ = inputDevices_.empty() ? -1 : 0;
+    }
+
+    ofSoundStreamSettings settings;
+    settings.sampleRate = static_cast<unsigned int>(sampleRate_);
+    settings.bufferSize = bufferSize_;
+    settings.numBuffers = 4;
+    settings.setInListener(this);
+    settings.setOutListener(this);
+
+    if (selectedInputDevice_ >= 0 && selectedInputDevice_ < static_cast<int>(inputDevices_.size())) {
+        const auto& inDevice = inputDevices_[selectedInputDevice_];
+        settings.setInDevice(inDevice);
+        settings.numInputChannels = std::min<std::size_t>(2, inDevice.inputChannels);
+        if (settings.numInputChannels == 0) {
+            ofLogWarning("ofApp") << "選択した入力デバイス '" << inDevice.name
+                                  << "' は入力チャンネルを提供しません。";
+        }
+    } else {
+        settings.numInputChannels = 0;
+    }
+
+    const auto& outDevice = outputDevices_[selectedOutputDevice_];
+    settings.setOutDevice(outDevice);
+    settings.numOutputChannels = std::min<std::size_t>(4, outDevice.outputChannels);
+    if (settings.numOutputChannels < 2) {
+        ofLogError("ofApp") << "選択した出力デバイス '" << outDevice.name
+                            << "' はステレオ出力に必要なチャンネル数を満たしていません。";
+        return false;
+    }
+
+    shutdownSoundStream();
+
+    try {
+        soundStream_.setup(settings);
+        soundStream_.start();
+        soundStreamActive_ = true;
+        configuredOutputChannels_ = static_cast<int>(settings.numOutputChannels);
+        if (settings.numOutputChannels < 4) {
+            ofLogWarning("ofApp") << "出力デバイス '" << outDevice.name << "' は "
+                                  << settings.numOutputChannels
+                                  << "ch までしか対応していません。ハプティクス用CH3/4は自動的にダウンミックスされます。";
+        } else {
+            ofLogNotice("ofApp") << "出力デバイス '" << outDevice.name << "' を "
+                                 << settings.numOutputChannels << "ch で初期化しました。";
+        }
+        updateAudioDeviceLabels();
+        return true;
+    } catch (const std::exception& ex) {
+        ofLogError("ofApp") << "オーディオデバイス初期化に失敗しました: " << ex.what();
+        soundStreamActive_ = false;
+        updateAudioDeviceLabels();
+        return false;
+    }
 }
 
 float ofApp::blendedEnvelope() const {
@@ -924,6 +1250,8 @@ void ofApp::handleTransitionEvent(const SceneController::TransitionEvent& event)
             audioFading_ = true;
             ofLogNotice("ofApp") << "Audio fade-in started after scene transition";
         }
+        audioRouter_.applyScenePreset(event.to);
+        ofLogNotice("ofApp") << "Audio routing preset reapplied for scene: " << sceneStateToString(event.to);
     }
 
     if (!event.manual && sceneTimingConfig_) {
@@ -1057,13 +1385,15 @@ void ofApp::drawScene(SceneState state, float alpha, double nowSeconds) {
 void ofApp::drawIdleScene(float alpha, double nowSeconds) {
     ofPushStyle();
     const float clampedAlpha = std::clamp(alpha, 0.0f, 1.0f);
+    const float envelopeP1 = std::clamp(participantEnvelopes_[0], 0.0f, 1.0f);
+    const float envelopeP2 = std::clamp(participantEnvelopes_[1], 0.0f, 1.0f);
     const float envelope = latestMetrics_.envelope;
     const float baseRadius = 180.0f;
     const float radiusOffset = envelope * 240.0f;
     const float centerY = ofGetHeight() * 0.5f;
 
     if (starfieldShaderLoaded_) {
-        drawStarfieldLayer(clampedAlpha, nowSeconds, envelope);
+        drawStarfieldLayer(clampedAlpha, nowSeconds, envelopeP1, envelopeP2);
     } else {
         ofColor background(8, 9, 18);
         background.a = static_cast<unsigned char>(clampedAlpha * 255.0f);
@@ -1079,16 +1409,18 @@ void ofApp::drawIdleScene(float alpha, double nowSeconds) {
             const float y = std::fmod(static_cast<float>(i) * 53.0f + static_cast<float>(nowSeconds) * 40.0f,
                                       static_cast<float>(ofGetHeight()));
             const float radius = 1.0f + 1.2f * std::sin(nowSeconds * 0.8 + i * 0.25f);
+            const float localEnv = ofLerp(envelopeP1, envelopeP2, u);
             ofColor starColor = starBase;
             starColor.a = static_cast<unsigned char>(
-                starBase.a * (0.6f + 0.4f * std::sin(nowSeconds * 0.5f + i * 0.2f)));
+                starBase.a * (0.4f + 0.6f * localEnv) *
+                (0.6f + 0.4f * std::sin(nowSeconds * 0.5f + i * 0.2f)));
             ofSetColor(starColor);
             ofDrawCircle(x, y, radius);
         }
     }
 
     if (rippleShaderLoaded_) {
-        drawRippleLayer(clampedAlpha, nowSeconds, envelope);
+        drawRippleLayer(clampedAlpha, nowSeconds, envelopeP1, envelopeP2);
     } else {
         ofNoFill();
         ofSetLineWidth(2.0f);
@@ -1100,8 +1432,8 @@ void ofApp::drawIdleScene(float alpha, double nowSeconds) {
             rippleColor.a = static_cast<unsigned char>(rippleColor.a * falloff * clampedAlpha);
             const float radius = baseRadius + radiusOffset + i * 36.0f;
             ofSetColor(rippleColor);
-            ofDrawCircle(ofGetWidth() * 0.3f, centerY, radius);
-            ofDrawCircle(ofGetWidth() * 0.7f, centerY, radius);
+            ofDrawCircle(ofGetWidth() * 0.3f, centerY, radius * (0.6f + 0.4f * envelopeP1));
+            ofDrawCircle(ofGetWidth() * 0.7f, centerY, radius * (0.6f + 0.4f * envelopeP2));
         }
         ofFill();
     }
@@ -1121,10 +1453,10 @@ void ofApp::drawStartScene(float alpha, double nowSeconds) {
     ofPushStyle();
     const float clampedAlpha = std::clamp(alpha, 0.0f, 1.0f);
     const double timeInState = sceneController_.timeInState(nowSeconds);
-    const float envelope = latestMetrics_.envelope;
-
+    const float envelopeP1 = std::clamp(participantEnvelopes_[0], 0.0f, 1.0f);
+    const float envelopeP2 = std::clamp(participantEnvelopes_[1], 0.0f, 1.0f);
     if (starfieldShaderLoaded_) {
-        drawStarfieldLayer(clampedAlpha, nowSeconds, envelope);
+        drawStarfieldLayer(clampedAlpha, nowSeconds, envelopeP1, envelopeP2);
     } else {
         ofColor background(12, 10, 28);
         background.a = static_cast<unsigned char>(clampedAlpha * 255.0f);
@@ -1238,8 +1570,9 @@ void ofApp::drawStartScene(float alpha, double nowSeconds) {
             ofDrawCircle(x, y, radius);
         }
     } else if (rippleShaderLoaded_) {
-        const float rippleEnvelope = std::max(envelope, breathingEnvelope);
-        drawRippleLayer(clampedAlpha * 0.6f, nowSeconds, rippleEnvelope);
+        const float rippleEnvelopeP1 = std::max(envelopeP1, breathingEnvelope);
+        const float rippleEnvelopeP2 = std::max(envelopeP2, breathingEnvelope);
+        drawRippleLayer(clampedAlpha * 0.6f, nowSeconds, rippleEnvelopeP1, rippleEnvelopeP2);
     }
 
     ofPopStyle();
@@ -1323,6 +1656,8 @@ void ofApp::drawFirstPhaseScene(float alpha, double nowSeconds) {
 void ofApp::drawExchangeScene(float alpha, double nowSeconds) {
     ofPushStyle();
     const float clampedAlpha = std::clamp(alpha, 0.0f, 1.0f);
+    const float envelopeP1 = std::clamp(participantEnvelopes_[0], 0.0f, 1.0f);
+    const float envelopeP2 = std::clamp(participantEnvelopes_[1], 0.0f, 1.0f);
 
     ofColor background(16, 12, 32);
     background.a = static_cast<unsigned char>(clampedAlpha * 255.0f);
@@ -1337,20 +1672,20 @@ void ofApp::drawExchangeScene(float alpha, double nowSeconds) {
         ofDrawBitmapString(title, 40, 80);
     }
 
-    const float envelope = latestMetrics_.envelope;
     const glm::vec2 leftCenter(ofGetWidth() * 0.35f, ofGetHeight() * 0.52f);
     const glm::vec2 rightCenter(ofGetWidth() * 0.65f, ofGetHeight() * 0.48f);
 
-    const float exchangePhase = 0.5f + 0.5f * static_cast<float>(std::sin(nowSeconds * 0.8));
-    const float leftRadius = safeLerp(140.0f, 260.0f, envelope);
-    const float rightRadius = safeLerp(140.0f, 260.0f, exchangePhase);
+    const float leftRadius = safeLerp(140.0f, 260.0f, envelopeP2);
+    const float rightRadius = safeLerp(140.0f, 260.0f, envelopeP1);
 
     ofNoFill();
     ofSetLineWidth(7.0f);
-    ofColor leftColor(110, 200, 255, static_cast<unsigned char>(clampedAlpha * 190.0f));
+    ofColor leftColor(110, 200, 255,
+                      static_cast<unsigned char>(clampedAlpha * (120.0f + 120.0f * envelopeP2)));
     ofSetColor(leftColor);
     ofDrawCircle(leftCenter, leftRadius);
-    ofColor rightColor(255, 150, 190, static_cast<unsigned char>(clampedAlpha * 190.0f));
+    ofColor rightColor(255, 150, 190,
+                       static_cast<unsigned char>(clampedAlpha * (120.0f + 120.0f * envelopeP1)));
     ofSetColor(rightColor);
     ofDrawCircle(rightCenter, rightRadius);
 
@@ -1381,6 +1716,8 @@ void ofApp::drawExchangeScene(float alpha, double nowSeconds) {
 void ofApp::drawMixedScene(float alpha, double nowSeconds) {
     ofPushStyle();
     const float clampedAlpha = std::clamp(alpha, 0.0f, 1.0f);
+    const float envelopeP1 = std::clamp(participantEnvelopes_[0], 0.0f, 1.0f);
+    const float envelopeP2 = std::clamp(participantEnvelopes_[1], 0.0f, 1.0f);
 
     ofColor background(18, 14, 24);
     background.a = static_cast<unsigned char>(clampedAlpha * 255.0f);
@@ -1412,7 +1749,10 @@ void ofApp::drawMixedScene(float alpha, double nowSeconds) {
         const float r = radius * wobble;
         const glm::vec2 pos = center + glm::vec2(std::cos(angle), std::sin(angle)) * r;
         const float hueMix = 0.5f + 0.5f * std::sin(angle * 3.0f + noisePhase);
-        const ofFloatColor color = ofFloatColor::fromHsb(ofWrap(hueMix * 0.08f + 0.55f, 0.0f, 1.0f), 0.7f, 0.9f,
+        const float envMix = ofLerp(envelopeP1, envelopeP2, (std::sin(angle) + 1.0f) * 0.5f);
+        const ofFloatColor color = ofFloatColor::fromHsb(ofWrap(hueMix * 0.08f + 0.55f, 0.0f, 1.0f),
+                                                         0.6f + 0.3f * envMix,
+                                                         0.55f + 0.35f * envMix,
                                                          clampedAlpha * 0.6f);
         mesh.addVertex(glm::vec3(pos, 0.0f));
         mesh.addColor(color);
@@ -1454,28 +1794,37 @@ void ofApp::drawEnvelopeGraph(const ofRectangle& area) const {
     ofSetColor(255, 255, 255, 160);
     ofDrawRectangle(area);
 
-    const auto& samples = envelopeHistory_.samples();
-    if (samples.size() < 2) {
+    const auto& aggregateSamples = envelopeHistory_.samples();
+    if (aggregateSamples.size() < 2) {
         ofPopStyle();
         return;
     }
 
-    const double start = samples.front().timestampSec;
-    const double end = samples.back().timestampSec;
+    const double start = aggregateSamples.front().timestampSec;
+    const double end = aggregateSamples.back().timestampSec;
     const double span = std::max(end - start, 1.0);
 
-    ofPolyline line;
-    for (const auto& sample : samples) {
-        const double norm = (sample.timestampSec - start) / span;
-        const float x = static_cast<float>(area.x + norm * area.width);
-        const float y = static_cast<float>(area.getBottom() - sample.envelope * area.height);
-        line.addVertex(x, y);
-    }
-    ofSetColor(120, 230, 255, 200);
-    line.draw();
+    auto drawSeries = [&](const std::deque<BeatVisualMetrics>& samples, const ofColor& color) {
+        if (samples.size() < 2) {
+            return;
+        }
+        ofPolyline line;
+        for (const auto& sample : samples) {
+            const double norm = (sample.timestampSec - start) / span;
+            const float x = static_cast<float>(area.x + std::clamp(norm, 0.0, 1.0) * area.width);
+            const float y = static_cast<float>(area.getBottom() - sample.envelope * area.height);
+            line.addVertex(x, y);
+        }
+        ofSetColor(color);
+        line.draw();
+    };
 
-    ofSetColor(255, 180);
-    ofDrawBitmapString("エンベロープ (直近 " + ofToString(span, 1) + "s)", area.x + 4.0f, area.y + 16.0f);
+    drawSeries(participantEnvelopeHistory_[0].samples(), ofColor(90, 200, 255, 200));
+    drawSeries(participantEnvelopeHistory_[1].samples(), ofColor(255, 150, 200, 200));
+    drawSeries(aggregateSamples, ofColor(200, 255, 180, 160));
+
+    ofSetColor(255, 200);
+    ofDrawBitmapString("Envelope P1/P2 (" + ofToString(span, 1) + "s)", area.x + 4.0f, area.y + 16.0f);
     ofPopStyle();
 }
 

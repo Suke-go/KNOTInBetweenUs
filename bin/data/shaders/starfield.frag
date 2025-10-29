@@ -2,7 +2,7 @@
 
 uniform vec2 uResolution;
 uniform float uTime;
-uniform float uEnvelope;
+uniform vec2 uEnvelopes;
 uniform float uAlpha;
 
 float hash(vec2 p) {
@@ -25,7 +25,8 @@ void main() {
     float twinkle = 0.3 + 0.7 * sin(uTime * 1.2 + h * 31.0);
 
     // Envelope連動: 心拍が強いと星が明るく
-    float intensity = mix(0.12, 0.65, clamp(uEnvelope, 0.0, 1.0));
+    float envelope = mix(uEnvelopes.x, uEnvelopes.y, clamp(uv.x, 0.0, 1.0));
+    float intensity = mix(0.12, 0.65, clamp(envelope, 0.0, 1.0));
 
     // 星の明るさ: 小さく鋭い輝き
     float star = sparkle * twinkle * intensity;

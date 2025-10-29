@@ -8,6 +8,7 @@
 #include "SceneController.h"
 #include "SceneTimingConfig.h"
 #include "audio/AudioPipeline.h"
+#include "audio/AudioRouter.h"
 #include "infra/SceneTransitionLogger.h"
 #include "infra/TelemetryLogging.h"
 
@@ -49,10 +50,12 @@ private:
 
     // Update helpers
     void updateSceneGui(double nowSeconds);
-    void updateEnvelopeHistory(double nowSeconds, float envelopeValue);
+    void updateEnvelopeHistories(double nowSeconds);
     void updateFakeSignal(double nowSeconds);
-    void applyBeatMetrics(const knot::audio::AudioPipeline::BeatMetrics& metrics, double nowSeconds);
-    void handleBeatEvents(const std::vector<knot::audio::BeatEvent>& events, double nowSeconds);
+    void applyBeatMetrics(knot::audio::ParticipantId participant,
+                          const knot::audio::AudioPipeline::ChannelMetrics& metrics, double nowSeconds);
+    void handleBeatEvents(knot::audio::ParticipantId participant,
+                          const std::vector<knot::audio::BeatEvent>& events, double nowSeconds);
     void appendHapticEvent(double nowSeconds, float intensity, const std::string& label);
     void updateEnvelopeCalibrationUi(double nowSeconds);
     void initializeSessionSeed();
@@ -84,15 +87,31 @@ private:
     bool shouldDrawStatusPanel() const;
     void updateCornerUnlock(double nowSeconds, int x, int y);
     void loadShaders();
-    void drawStarfieldLayer(float alpha, double nowSeconds, float envelope);
-    void drawRippleLayer(float alpha, double nowSeconds, float envelope);
+    void drawStarfieldLayer(float alpha, double nowSeconds, float envelopeP1, float envelopeP2);
+    void drawRippleLayer(float alpha, double nowSeconds, float envelopeP1, float envelopeP2);
     float blendedEnvelope() const;
+    void refreshAudioDeviceList();
+    void updateAudioDeviceLabels();
+    void selectNextInputDevice(int delta);
+    void selectNextOutputDevice(int delta);
+    void onRefreshAudioDevices();
+    void onPrevInputDevice();
+    void onNextInputDevice();
+    void onPrevOutputDevice();
+    void onNextOutputDevice();
+    void onApplyAudioDevices();
+    void shutdownSoundStream();
+    bool setupSoundStreamWithSelection();
 
     // UI + state
     SceneController sceneController_;
     HapticLog hapticLog_{128};
     BeatEnvelopeHistory envelopeHistory_;
     BeatVisualMetrics latestMetrics_;
+    std::array<BeatVisualMetrics, 2> participantMetrics_{};
+    std::array<float, 2> participantEnvelopes_{0.0f, 0.0f};
+    std::array<float, 2> participantBpms_{0.0f, 0.0f};
+    std::array<BeatEnvelopeHistory, 2> participantEnvelopeHistory_;
     knot::audio::AudioPipeline::SignalHealth signalHealth_{};
     bool lastFallbackActive_ = false;
     float displayEnvelope_ = 0.0f;
@@ -103,12 +122,24 @@ private:
     ofParameter<std::string> sceneParam_;
     ofParameter<float> bpmParam_;
     ofParameter<float> envelopeParam_;
+    ofParameter<float> bpmP1Param_;
+   ofParameter<float> bpmP2Param_;
+   ofParameter<float> envelopeP1Param_;
+   ofParameter<float> envelopeP2Param_;
     ofParameter<std::uint32_t> hapticCountParam_;
     ofParameter<bool> simulateSignalParam_;
     ofxButton startButton_;
     ofxButton endButton_;
     ofxButton resetButton_;
     ofxButton envelopeCalibrationButton_;
+    ofxButton refreshDevicesButton_;
+    ofxButton prevInputDeviceButton_;
+    ofxButton nextInputDeviceButton_;
+    ofxButton prevOutputDeviceButton_;
+    ofxButton nextOutputDeviceButton_;
+    ofxButton applyAudioDevicesButton_;
+    ofParameter<std::string> inputDeviceLabel_;
+    ofParameter<std::string> outputDeviceLabel_;
     ofxPanel statusPanel_;
     ofParameter<std::string> sceneOverviewParam_;
     ofParameter<float> transitionProgressParam_;
@@ -125,7 +156,7 @@ private:
     ofTrueTypeFont guideFont_;
 
     double lastEnvelopeSampledAt_ = 0.0;
-    double lastSimulatedBeatAt_ = 0.0;
+    std::array<double, 2> lastSimulatedBeatAt_{0.0, 0.0};
 
     infra::AppConfig appConfig_;
     std::unique_ptr<infra::SessionLogger> sessionLogger_;
@@ -176,4 +207,14 @@ private:
     double audioFadeStartTime_ = 0.0;
     double audioFadeDuration_ = 10.0;
     bool audioFading_ = false;
+    knot::audio::AudioRouter audioRouter_;
+    ofSoundBuffer stereoScratch_;
+    std::array<float, 2> envelopeFrame_{0.0f, 0.0f};
+    std::array<float, 2> headphoneFrame_{0.0f, 0.0f};
+    std::array<float, 4> routedFrame_{0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<ofSoundDevice> inputDevices_;
+    std::vector<ofSoundDevice> outputDevices_;
+    int selectedInputDevice_ = -1;
+    int selectedOutputDevice_ = -1;
+    int configuredOutputChannels_ = 4;
 };

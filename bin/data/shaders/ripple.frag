@@ -2,35 +2,38 @@
 
 uniform vec2 uResolution;
 uniform float uTime;
-uniform float uEnvelope;
+uniform vec2 uEnvelopes;
 uniform float uAlpha;
 
 void main() {
     vec2 uv = gl_FragCoord.xy / uResolution;
-    vec2 center = vec2(0.5);
-    float dist = distance(uv, center);
+    vec2 centerL = vec2(0.32, 0.5);
+    vec2 centerR = vec2(0.68, 0.5);
 
-    // 波紋の位相: よりゆっくりとした伝播
-    float wave = sin((dist - uTime * 0.18) * 35.0);
+    float distL = distance(uv, centerL);
+    float distR = distance(uv, centerR);
 
-    // 減衰曲線: 中心から外側へのグラディエント強化
-    // exp + smoothstep の組み合わせで滑らかな濃淡
-    float decay = exp(-dist * 4.0);
-    float fadeEdge = smoothstep(0.8, 0.0, dist);  // 外側を滑らかに消失
+    float waveL = sin((distL - uTime * 0.18) * 35.0);
+    float waveR = sin((distR - uTime * 0.18) * 35.0);
 
-    float envelope = clamp(uEnvelope, 0.0, 1.0);
+    float decayL = exp(-distL * 4.0);
+    float decayR = exp(-distR * 4.0);
+    float fadeEdgeL = smoothstep(0.8, 0.0, distL);
+    float fadeEdgeR = smoothstep(0.8, 0.0, distR);
 
-    // 波紋の明るさ: sin波を0-1に正規化し、減衰とenvelope適用
-    float waveIntensity = wave * 0.5 + 0.5;
-    float intensity = waveIntensity * decay * fadeEdge * mix(0.15, 0.85, envelope);
-    intensity = clamp(intensity, 0.0, 1.0);
+    float envL = clamp(uEnvelopes.x, 0.0, 1.0);
+    float envR = clamp(uEnvelopes.y, 0.0, 1.0);
 
-    // グラディエーションカラー: 中心(明るい青)→外側(暗い紫)
-    vec3 innerColor = vec3(0.4, 0.55, 0.85);   // 明るい青
-    vec3 outerColor = vec3(0.15, 0.22, 0.45);  // 暗い紫
-    vec3 color = mix(outerColor, innerColor, intensity) * intensity;
+    float waveIntensityL = waveL * 0.5 + 0.5;
+    float waveIntensityR = waveR * 0.5 + 0.5;
 
-    // アルファ: 濃淡を反映
-    float alpha = clamp(intensity * uAlpha * 1.5, 0.0, 1.0);
+    float intensityL = clamp(waveIntensityL * decayL * fadeEdgeL * mix(0.12, 0.9, envL), 0.0, 1.0);
+    float intensityR = clamp(waveIntensityR * decayR * fadeEdgeR * mix(0.12, 0.9, envR), 0.0, 1.0);
+
+    vec3 colorL = mix(vec3(0.12, 0.18, 0.35), vec3(0.38, 0.6, 0.95), intensityL);
+    vec3 colorR = mix(vec3(0.2, 0.12, 0.38), vec3(0.95, 0.42, 0.65), intensityR);
+    vec3 color = colorL * intensityL + colorR * intensityR;
+
+    float alpha = clamp((intensityL + intensityR) * 0.75 * uAlpha, 0.0, 1.0);
     gl_FragColor = vec4(color, alpha);
 }
