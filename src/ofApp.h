@@ -4,6 +4,7 @@
 #include "ofxGui.h"
 
 #include "BeatVisualizer.h"
+#include "BloomRenderer.h"
 #include "HapticLog.h"
 #include "SceneController.h"
 #include "SceneTimingConfig.h"
@@ -14,6 +15,7 @@
 
 #include <array>
 #include <filesystem>
+#include <glm/vec2.hpp>
 #include <optional>
 #include <memory>
 #include <string>
@@ -61,6 +63,18 @@ private:
     void initializeSessionSeed();
     static bool ensureParentDirectory(const std::filesystem::path& path);
 
+    struct Ripple {
+        double birthTime;
+        glm::vec2 position;
+        float initialRadius;
+    };
+
+    // Synthetic heartbeat generation
+    struct SyntheticHeartbeatGenerator {
+        double lastBeatSample_ = 0.0;  // Last beat sample position
+        double totalSamples_ = 0.0;  // Total samples processed (for timing)
+    };
+
     // Drawing helpers
     void drawScene(SceneState state, float alpha, double nowSeconds);
     void drawIdleScene(float alpha, double nowSeconds);
@@ -68,7 +82,8 @@ private:
     void drawFirstPhaseScene(float alpha, double nowSeconds);
     void drawExchangeScene(float alpha, double nowSeconds);
     void drawMixedScene(float alpha, double nowSeconds);
-    void drawEndScene(float alpha);
+    void drawEndScene(float alpha, double nowSeconds);
+    void drawAmoebaOrganism(float alpha, double nowSeconds);
     void drawEnvelopeGraph(const ofRectangle& area) const;
     void drawHapticLog(const ofRectangle& area, double nowSeconds) const;
     void drawHapticChart(const ofRectangle& area, double nowSeconds) const;
@@ -87,7 +102,7 @@ private:
     bool shouldDrawStatusPanel() const;
     void updateCornerUnlock(double nowSeconds, int x, int y);
     void loadShaders();
-    void drawStarfieldLayer(float alpha, double nowSeconds, float envelopeP1, float envelopeP2);
+    void drawStarfieldLayer(float alpha, double nowSeconds, float envelopeP1, float envelopeP2, bool idleMode = false);
     void drawRippleLayer(float alpha, double nowSeconds, float envelopeP1, float envelopeP2);
     float blendedEnvelope() const;
     void refreshAudioDeviceList();
@@ -197,9 +212,13 @@ private:
     ofShader starfieldShader_;
     ofShader torusShader_;
     ofShader rippleShader_;
+    ofShader realisticLightShader_;
+    ofShader amoebaOrganismShader_;
     bool starfieldShaderLoaded_ = false;
     bool torusShaderLoaded_ = false;
     bool rippleShaderLoaded_ = false;
+    bool realisticLightShaderLoaded_ = false;
+    bool amoebaOrganismShaderLoaded_ = false;
     ofSoundPlayer bellSound_;
     bool bellSoundLoaded_ = false;
     float audioFadeGain_ = 1.0f;
@@ -211,10 +230,45 @@ private:
     ofSoundBuffer stereoScratch_;
     std::array<float, 2> envelopeFrame_{0.0f, 0.0f};
     std::array<float, 2> headphoneFrame_{0.0f, 0.0f};
-    std::array<float, 4> routedFrame_{0.0f, 0.0f, 0.0f, 0.0f};
+    std::array<float, 6> routedFrame_{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     std::vector<ofSoundDevice> inputDevices_;
     std::vector<ofSoundDevice> outputDevices_;
     int selectedInputDevice_ = -1;
     int selectedOutputDevice_ = -1;
-    int configuredOutputChannels_ = 4;
+    int configuredOutputChannels_ = 6;
+
+    // Bloom renderer
+    BloomRenderer bloomRenderer_;
+
+    // Heartbeat tracking
+    std::array<float, 2> participantHeartbeatPhase_{0.0f, 0.0f};
+
+    // Ripples
+    std::vector<Ripple> ripples_;
+    double lastExchangeRippleTime1_ = 0.0;
+    double lastExchangeRippleTime2_ = 0.0;
+
+    // Synthetic heartbeat generation
+    std::array<SyntheticHeartbeatGenerator, 2> syntheticHeartbeatGenerators_;
+    ofSoundBuffer syntheticHeartbeatBuffer_;
+
+    // Drawing helpers for heartbeat visuals
+    void drawHeartbeatLight(const glm::vec2& position, float phase, float alpha, float sizeScale = 1.0f);
+    void drawHeartbeatLightRealistic(const glm::vec2& position, float phase, float alpha, float sizeScale, double nowSeconds);
+    void drawSubtleNoise(float alpha, double nowSeconds);
+    void drawHeartbeatRipples(float alpha, double nowSeconds);
+    void drawEnhancedHeartbeatRipples(float alpha, double nowSeconds, float riseUpFactor, 
+                                   const glm::vec2& leftLightPos = glm::vec2(0.0f), 
+                                   const glm::vec2& rightLightPos = glm::vec2(0.0f));
+    void drawExchangeRipplesFromLights(float alpha, double nowSeconds, 
+                                       const glm::vec2& leftLightPos, const glm::vec2& rightLightPos,
+                                       float phase1, float phase2);
+    void drawStageText(double timeInState, float alpha);
+
+    // Synthetic heartbeat generation
+    float generateHeartbeatSample(double timeSinceBeatStart, double sampleRate);
+    void generateSyntheticHeartbeatBuffer(ofSoundBuffer& buffer, float bpmP1, float bpmP2);
+
+    // Debug flag
+    bool debugMode_ = false;
 };

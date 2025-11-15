@@ -11,5 +11,5 @@
   "sessionSeed": "config/session_seed.json",
   "enableSyntheticTelemetry": false,
   "defaultScene": "Idle",
-  "inputGainDb": 25.0
+  "inputGainDb": 20.0
 }

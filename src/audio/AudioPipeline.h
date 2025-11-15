@@ -3,8 +3,11 @@
 #include "BeatTimeline.h"
 #include "Calibration.h"
 #include "ParticipantId.h"
+#include "PinkNoiseFilter.h"
 #include "SimpleLimiter.h"
 #include "Utility.h"
+#include "BiquadFilter.h"
+#include "CrossCorrelationNoiseReducer.h"
 
 #include "ofSoundBuffer.h"
 
@@ -89,10 +92,11 @@ private:
     mutable std::mutex mutex_;
     std::array<std::vector<float>, 2> channelBuffers_;
     std::vector<float> outputScratch_;
-    std::vector<float> noiseBuffer_;
-    std::mt19937 rng_;
-    std::normal_distribution<float> noiseDist_{0.0f, 1.0f};
+    std::array<PinkNoiseFilter, 2> pinkNoiseFilters_;  // Stereo pink noise (L/R)
     float inputGainLinear_ = 1.0f;
+    float targetInputGainLinear_ = 1.0f;
+    float smoothedInputGainLinear_ = 1.0f;
+    static constexpr float kGainSmoothingCoeff = 0.01f;  // 約100ms @48kHz
     BeatMetrics metrics_{};
     std::array<std::deque<BeatEvent>, 2> pendingEventsByChannel_;
     std::array<ChannelMetrics, 2> channelMetrics_{};
@@ -115,6 +119,16 @@ private:
     double lastFallbackEmitSec_ = 0.0;
     SignalHealth signalHealth_{};
     std::uint64_t legacySequenceCounter_ = 0;
+
+    // Gentle boost around ~100 Hz for heartbeat presence (per channel)
+    BiquadFilter lowBandEnhance_[2]{};
+    float lowBandEnhanceMix_ = 0.05f; // small parallel band boost (~+1 dB perceived at center)
+    // High-pass to remove sub-bass/rumble when input is poor
+    BiquadFilter rumbleHighPass_[2]{};
+    // Notch filter to remove power line noise (50/60Hz)
+    std::array<BiquadFilter, 2> notchFilters_{};
+    // Cross-correlation based noise reducer to remove common environmental noise
+    CrossCorrelationNoiseReducer noiseReducer_;
 
     void applyCalibration(float& ch1, float& ch2) const;
     void ensureBufferSizes(std::size_t numFrames);

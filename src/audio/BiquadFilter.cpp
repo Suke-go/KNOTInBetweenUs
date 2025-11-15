@@ -51,6 +51,14 @@ void BiquadFilter::computeCoefficients() {
             a1 = -2.0 * cos_omega;
             a2 = 1.0 - alpha;
             break;
+        case Type::Notch:
+            b0 = 1.0;
+            b1 = -2.0 * cos_omega;
+            b2 = 1.0;
+            a0 = 1.0 + alpha;
+            a1 = -2.0 * cos_omega;
+            a2 = 1.0 - alpha;
+            break;
     }
 
     const double inv_a0 = 1.0 / a0;

@@ -10,24 +10,37 @@
 namespace knot::audio {
 
 namespace {
-constexpr float kSelfGainDb = -15.0f;
-constexpr float kNoiseGainDb = -24.0f;
+constexpr float kSelfGainDb = -16.0f;
+constexpr float kNoiseGainDb = -23.0f;
 } // namespace
 
 void AudioPipeline::setup(double sampleRate, std::size_t bufferSize) {
     sampleRate_ = sampleRate;
     bufferSize_ = bufferSize;
+    // Ensure default pass-through gains so mic input is audible before calibration
     calibrationValues_[0] = {"CH1", 1.0f, 0.0f, 0};
     calibrationValues_[1] = {"CH2", 1.0f, 0.0f, 0};
     calibrationSession_.setup(sampleRate_, bufferSize_, 4);
     beatTimelines_[0].setup(sampleRate_, ParticipantId::Participant1);
     beatTimelines_[1].setup(sampleRate_, ParticipantId::Participant2);
     limiter_.setup(sampleRate_, -3.0f, 80.0f);
-    rng_.seed(std::random_device{}());
     for (auto& channelBuffer : channelBuffers_) {
         channelBuffer.assign(bufferSize_, 0.0f);
     }
-    noiseBuffer_.assign(bufferSize_, 0.0f);
+    for (auto& filter : pinkNoiseFilters_) {
+        filter.reset();
+    }
+    // Setup gentle enhancement filters around ~100 Hz (parallel bandpass)
+    lowBandEnhance_[0].setup(BiquadFilter::Type::BandPass, sampleRate_, 100.0, 1.0);
+    lowBandEnhance_[1].setup(BiquadFilter::Type::BandPass, sampleRate_, 100.0, 1.0);
+    // Setup rumble high-pass (~50 Hz) to avoid sub-bass build-up
+    rumbleHighPass_[0].setup(BiquadFilter::Type::HighPass, sampleRate_, 50.0, 0.707);
+    rumbleHighPass_[1].setup(BiquadFilter::Type::HighPass, sampleRate_, 50.0, 0.707);
+    // Setup notch filters to remove power line noise (50Hz, Q=10.0 for narrow notch)
+    notchFilters_[0].setup(BiquadFilter::Type::Notch, sampleRate_, 50.0, 10.0);
+    notchFilters_[1].setup(BiquadFilter::Type::Notch, sampleRate_, 50.0, 10.0);
+    // Setup cross-correlation noise reducer
+    noiseReducer_.setup(sampleRate_);
     outputScratch_.assign(bufferSize_ * 2, 0.0f);
     totalSamplesProcessed_ = 0.0;
     limiterReductionDb_ = 0.0f;
@@ -56,16 +69,22 @@ void AudioPipeline::setup(double sampleRate, std::size_t bufferSize) {
         pending.clear();
     }
     legacySequenceCounter_ = 0;
+    targetInputGainLinear_ = 1.0f;
+    smoothedInputGainLinear_ = 1.0f;
 }
 
 void AudioPipeline::setNoiseSeed(std::uint32_t seed) {
     std::lock_guard<std::mutex> lock(mutex_);
-    rng_.seed(seed);
+    // Reset pink noise filters to ensure deterministic behavior
+    for (auto& filter : pinkNoiseFilters_) {
+        filter.reset();
+    }
 }
 
 void AudioPipeline::setInputGainDb(float gainDb) {
     std::lock_guard<std::mutex> lock(mutex_);
-    inputGainLinear_ = dbToLinear(gainDb);
+    targetInputGainLinear_ = dbToLinear(gainDb);
+    // smoothedInputGainLinear_ は audioIn() 内で段階的に更新
 }
 
 void AudioPipeline::ensureBufferSizes(std::size_t numFrames) {
@@ -73,9 +92,6 @@ void AudioPipeline::ensureBufferSizes(std::size_t numFrames) {
         if (channelBuffer.size() < numFrames) {
             channelBuffer.assign(numFrames, 0.0f);
         }
-    }
-    if (noiseBuffer_.size() < numFrames) {
-        noiseBuffer_.assign(numFrames, 0.0f);
     }
     if (outputScratch_.size() < numFrames * 4) {
         outputScratch_.assign(numFrames * 4, 0.0f);
@@ -103,6 +119,7 @@ void AudioPipeline::startCalibration() {
     calibrationArmed_ = true;
     calibrationCompleted_ = false;
     limiter_.reset();
+    noiseReducer_.reset();
     beatTimelines_[0].setup(sampleRate_, ParticipantId::Participant1);
     beatTimelines_[1].setup(sampleRate_, ParticipantId::Participant2);
     metrics_ = {};
@@ -140,8 +157,11 @@ bool AudioPipeline::calibrationReady() const {
 }
 
 void AudioPipeline::applyCalibration(float& ch1, float& ch2) const {
-    ch1 *= calibrationValues_[0].gain;
-    ch2 *= calibrationValues_[1].gain;
+    // Guard against accidental zeroed gains (treat as unity)
+    const float g1 = (calibrationValues_[0].gain > 0.0f) ? calibrationValues_[0].gain : 1.0f;
+    const float g2 = (calibrationValues_[1].gain > 0.0f) ? calibrationValues_[1].gain : 1.0f;
+    ch1 *= g1;
+    ch2 *= g2;
 }
 
 void AudioPipeline::startEnvelopeCalibration(double durationSec) {
@@ -178,13 +198,56 @@ bool AudioPipeline::pollEnvelopeCalibrationStats(EnvelopeCalibrationStats& stats
 
 void AudioPipeline::audioIn(const ofSoundBuffer& buffer) {
     const auto numFrames = static_cast<std::size_t>(buffer.getNumFrames());
+    
+    // Debug: Log input status periodically (every ~100 calls, roughly 2 seconds at 48kHz/512 frames)
+    static std::size_t audioPipelineInCallCount = 0;
+    audioPipelineInCallCount++;
+    const bool shouldLog = (audioPipelineInCallCount % 100 == 0);
+    
     if (buffer.getNumChannels() < 2 || numFrames == 0) {
+        if (shouldLog) {
+            ofLogWarning("AudioPipeline::audioIn") << "Invalid input buffer - channels: " 
+                                                    << buffer.getNumChannels() 
+                                                    << ", frames: " << numFrames;
+        }
         return;
+    }
+    
+    if (shouldLog) {
+        ofLogNotice("AudioPipeline::audioIn") << "=== AudioPipeline Input Debug (call " << audioPipelineInCallCount << ") ===";
+        ofLogNotice("AudioPipeline::audioIn") << "Input channels: " << buffer.getNumChannels();
+        ofLogNotice("AudioPipeline::audioIn") << "Input frames: " << numFrames;
+        ofLogNotice("AudioPipeline::audioIn") << "calibrationArmed_: " << (calibrationArmed_ ? "YES" : "NO");
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
     ensureBufferSizes(numFrames);
+    
+    // Smooth gain changes to prevent sudden jumps from rubbing sounds
+    const float gainDiff = targetInputGainLinear_ - smoothedInputGainLinear_;
+    smoothedInputGainLinear_ += gainDiff * kGainSmoothingCoeff;
+    inputGainLinear_ = smoothedInputGainLinear_;
+    
     const float* input = buffer.getBuffer().data();
+    
+    // Debug: Log input signal level periodically (calculate before processing)
+    if (shouldLog) {
+        float maxCh1 = 0.0f, maxCh2 = 0.0f;
+        float rmsCh1 = 0.0f, rmsCh2 = 0.0f;
+        for (std::size_t frame = 0; frame < numFrames; ++frame) {
+            const float ch1 = input[frame * 2];
+            const float ch2 = input[frame * 2 + 1];
+            maxCh1 = std::max(maxCh1, std::fabs(ch1));
+            maxCh2 = std::max(maxCh2, std::fabs(ch2));
+            rmsCh1 += ch1 * ch1;
+            rmsCh2 += ch2 * ch2;
+        }
+        rmsCh1 = std::sqrt(rmsCh1 / numFrames);
+        rmsCh2 = std::sqrt(rmsCh2 / numFrames);
+        ofLogNotice("AudioPipeline::audioIn") << "Raw input level - CH1: max=" << maxCh1 << " rms=" << rmsCh1
+                                               << " | CH2: max=" << maxCh2 << " rms=" << rmsCh2;
+        ofLogNotice("AudioPipeline::audioIn") << "inputGainLinear_: " << inputGainLinear_;
+    }
 
     if (calibrationArmed_) {
         calibrationSession_.capture(input, numFrames);
@@ -195,6 +258,12 @@ void AudioPipeline::audioIn(const ofSoundBuffer& buffer) {
         for (std::size_t frame = 0; frame < numFrames; ++frame) {
             float ch1 = input[frame * 2];
             float ch2 = input[frame * 2 + 1];
+            // Apply notch filter to remove power line noise (50/60Hz)
+            ch1 = notchFilters_[0].process(ch1);
+            ch2 = notchFilters_[1].process(ch2);
+            // Apply cross-correlation based noise reduction
+            // Removes common environmental noise while preserving independent heartbeat signals
+            noiseReducer_.process(ch1, ch2);
             if (inputGainLinear_ != 1.0f) {
                 ch1 = std::clamp(ch1 * inputGainLinear_, -1.0f, 1.0f);
                 ch2 = std::clamp(ch2 * inputGainLinear_, -1.0f, 1.0f);
@@ -218,6 +287,15 @@ void AudioPipeline::audioIn(const ofSoundBuffer& buffer) {
                 (totalSamplesProcessed_ + static_cast<double>(numFrames)) / sampleRate_;
             channelMetric.triggered = beatTimelines_[channel].lastFrameTriggered();
             channelMetric.participantId = participantId;
+            
+            // Debug: Log envelope values periodically
+            if (shouldLog) {
+                ofLogNotice("AudioPipeline::audioIn") << "Channel " << channel 
+                                                       << " (P" << (channel + 1) << ")"
+                                                       << " - envelope: " << channelMetric.envelope
+                                                       << " | BPM: " << channelMetric.bpm
+                                                       << " | triggered: " << (channelMetric.triggered ? "YES" : "NO");
+            }
 
             if (channelMetric.triggered) {
                 const auto& events = beatTimelines_[channel].events();
@@ -345,21 +423,45 @@ void AudioPipeline::audioOut(ofSoundBuffer& buffer) {
     }
 
     const float selfGain = dbToLinear(kSelfGainDb);
-    const float noiseGain = dbToLinear(kNoiseGainDb);
+    const float baseNoiseGain = dbToLinear(kNoiseGainDb);
 
-    for (std::size_t frame = 0; frame < numFrames; ++frame) {
-        noiseBuffer_[frame] = noiseDist_(rng_);
+    // Get current envelopes for dynamic noise adjustment
+    const float envP1 = channelMetrics_[0].envelope;
+    const float envP2 = channelMetrics_[1].envelope;
+    const float maxEnv = std::max(envP1, envP2);
+
+    // Dynamic noise gain: reduce noise when heartbeat is strong
+    // Also gate noise down significantly when no heartbeat is detected
+    float dynamicNoiseGain = baseNoiseGain * (1.0f - 0.7f * maxEnv);
+    if (maxEnv < 0.02f) {
+        dynamicNoiseGain = baseNoiseGain * 0.12f; // keep very low when input/envelope is absent
     }
+
+    // Gate enhancement when no heartbeat present
+    const float enhanceMix = (maxEnv < 0.02f) ? 0.0f : std::clamp(lowBandEnhanceMix_, 0.0f, 0.45f);
 
     for (std::size_t frame = 0; frame < numFrames; ++frame) {
         const float heartbeatP1 =
             frame < channelBuffers_[0].size() ? channelBuffers_[0][frame] : 0.0f;
         const float heartbeatP2 =
             frame < channelBuffers_[1].size() ? channelBuffers_[1][frame] : 0.0f;
-        const float noise = noiseBuffer_[frame] * noiseGain;
 
-        float left = heartbeatP1 * selfGain + noise;
-        float right = heartbeatP2 * selfGain + noise;
+        // Parallel band-limited enhancement around ~100 Hz (gentle)
+        const float bandP1 = lowBandEnhance_[0].process(heartbeatP1);
+        const float bandP2 = lowBandEnhance_[1].process(heartbeatP2);
+        float enhancedP1 = heartbeatP1 + enhanceMix * bandP1;
+        float enhancedP2 = heartbeatP2 + enhanceMix * bandP2;
+        // Remove sub-bass/rumble
+        enhancedP1 = rumbleHighPass_[0].process(enhancedP1);
+        enhancedP2 = rumbleHighPass_[1].process(enhancedP2);
+
+        // Generate independent stereo pink noise for spatial depth
+        const float pinkNoiseL = pinkNoiseFilters_[0].process() * dynamicNoiseGain;
+        const float pinkNoiseR = pinkNoiseFilters_[1].process() * dynamicNoiseGain;
+
+        // Mix heartbeats with stereo pink noise
+        float left = enhancedP1 * selfGain + pinkNoiseL;
+        float right = enhancedP2 * selfGain + pinkNoiseR;
 
         const float detectionSample = (std::fabs(left) >= std::fabs(right)) ? left : right;
         limiter_.process(detectionSample);

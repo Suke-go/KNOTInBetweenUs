@@ -9,7 +9,8 @@ public:
     enum class Type {
         BandPass,
         LowPass,
-        HighPass
+        HighPass,
+        Notch
     };
 
     void setup(Type type, double sampleRate, double freqHz, double q);

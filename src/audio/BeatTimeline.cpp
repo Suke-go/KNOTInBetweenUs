@@ -12,9 +12,9 @@ void BeatTimeline::setup(double sampleRate) {
 void BeatTimeline::setup(double sampleRate, ParticipantId participantId) {
     sampleRate_ = sampleRate;
     participantId_ = participantId;
-    bandPass1_.setup(BiquadFilter::Type::HighPass, sampleRate_, 20.0, 0.707);
-    bandPass2_.setup(BiquadFilter::Type::LowPass, sampleRate_, 150.0, 0.707);
-    envelopeFollower_.setup(sampleRate_, 5.0f, 60.0f);
+    bandPass1_.setup(BiquadFilter::Type::HighPass, sampleRate_, 50.0, 0.707);
+    bandPass2_.setup(BiquadFilter::Type::LowPass, sampleRate_, 120.0, 0.707);
+    envelopeFollower_.setup(sampleRate_, 10.0f, 60.0f);
     adaptiveThreshold_ = 0.0f;
     thresholdHoldMs_ = 120.0f;
     holdSamples_ = static_cast<std::size_t>(sampleRate_ * (thresholdHoldMs_ * 0.001f));
