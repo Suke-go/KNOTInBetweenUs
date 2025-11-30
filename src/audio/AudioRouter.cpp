@@ -12,7 +12,9 @@
 #include "ofLog.h"
 #include "ofJson.h"
 #include "ofFileUtils.h"
+#include "ofUtils.h"
 #include <glm/gtc/constants.hpp>
+#include <filesystem>
 
 namespace {
 
@@ -77,16 +79,25 @@ void AudioRouter::setup(float sampleRateHz) {
         listenerState.fill(0.0f);
     }
     
-    // HRTFプロセッサの初期化（将来の拡張用）
-    // 現在は使用しない（useHrtf_ = false）
+    // HRTFプロセッサの初期化
+    const std::string sofaPath = ofToDataPath("hrir/mit_kemar_normal_pinna.sofa", true);
+    const bool sofaExists = std::filesystem::exists(sofaPath);
+    std::size_t hrtfLoadedCount = 0;
     for (auto& listenerProcessors : hrtfProcessors_) {
         for (auto& processor : listenerProcessors) {
             processor = std::make_unique<HrtfProcessor>();
-            // 将来的にHRTFデータを読み込む場合:
-            // processor->loadHrtfData("hrir/mit_kemar_normal_pinna.sofa");
+            processor->setSampleRate(sampleRateHz_);
+            if (sofaExists && processor->loadHrtfData(sofaPath)) {
+                ++hrtfLoadedCount;
+            }
         }
     }
-    useHrtf_ = false;  // 現在は簡易的な空間音響を使用
+    useHrtf_ = hrtfLoadedCount > 0;
+    if (!useHrtf_) {
+        ofLogWarning("AudioRouter") << "HRTF disabled (missing libmysofa or SOFA asset). Falling back to simplified spatial audio.";
+    } else {
+        ofLogNotice("AudioRouter") << "HRTF enabled using " << sofaPath;
+    }
 }
 
 void AudioRouter::setRoutingRule(OutputChannel channel, const RoutingRule& rule) {
