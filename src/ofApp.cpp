@@ -2208,6 +2208,7 @@ void ofApp::drawExchangeScene(float alpha, double nowSeconds) {
     const float clampedAlpha = std::clamp(alpha, 0.0f, 1.0f);
     const float envelopeP1 = std::clamp(participantEnvelopes_[0], 0.0f, 1.0f);
     const float envelopeP2 = std::clamp(participantEnvelopes_[1], 0.0f, 1.0f);
+    const float averageEnvelope = 0.5f * (envelopeP1 + envelopeP2);
     const double timeInExchange = sceneController_.timeInState(nowSeconds);
 
     // 背景: FirstPhaseと同様の深い青色（星空や銀河の表現は使用しない）
@@ -2295,6 +2296,7 @@ void ofApp::drawMixedScene(float alpha, double nowSeconds) {
     const float clampedAlpha = std::clamp(alpha, 0.0f, 1.0f);
     const float envelopeP1 = std::clamp(participantEnvelopes_[0], 0.0f, 1.0f);
     const float envelopeP2 = std::clamp(participantEnvelopes_[1], 0.0f, 1.0f);
+    const float averageEnvelope = 0.5f * (envelopeP1 + envelopeP2);
 
     // 背景
     ofColor background(18, 14, 24);
@@ -2302,11 +2304,21 @@ void ofApp::drawMixedScene(float alpha, double nowSeconds) {
     ofSetColor(background);
     ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
 
+    // 背景グローの呼吸感（最小輝度を確保しつつ8-12秒周期で揺らぐ）
+    const float breathingPeriod = 10.0f;
+    const float breathingPhase = static_cast<float>(nowSeconds * glm::two_pi<double>() / breathingPeriod);
+    const float breathingGlow = 0.15f + 0.85f * (0.5f + 0.5f * std::sin(breathingPhase));
+    ofEnableBlendMode(OF_BLENDMODE_ADD);
+    ofSetColor(60, 50, 80, static_cast<unsigned char>(clampedAlpha * breathingGlow * 90.0f));
+    ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
+    ofDisableBlendMode();
+
     // テキスト表示を削除（USER_EXPERIENCE_PHASES.mdの要件に従って）
 
     const glm::vec2 center(ofGetWidth() * 0.5f, ofGetHeight() * 0.55f);
     const float envelope = latestMetrics_.envelope;
-    const float baseRadius = safeLerp(160.0f, 320.0f, envelope);
+    const float easedEnvelope = 0.5f - 0.5f * std::cos(std::clamp(envelope, 0.0f, 1.0f) * glm::pi<float>());
+    const float baseRadius = safeLerp(160.0f, 320.0f, easedEnvelope);
 
     // 2つの心拍の位相を取得（0.0-1.0の範囲をラジアンに変換）
     const float phase1 = participantHeartbeatPhase_[0] * 2.0f * glm::pi<float>();
@@ -2323,6 +2335,14 @@ void ofApp::drawMixedScene(float alpha, double nowSeconds) {
         phaseDiff = 2.0f * glm::pi<float>() - phaseDiff;
     }
     const float syncLevel = 1.0f - (phaseDiff / glm::pi<float>());
+
+    // 同期瞬間の波紋を追加（位相差が十分に小さいときのみ）
+    const float syncRippleThreshold = 0.1f;
+    const double minSyncRippleInterval = 0.8;
+    if (phaseDiff < syncRippleThreshold && (nowSeconds - lastMixedSyncRippleTime_) > minSyncRippleInterval) {
+        ripples_.push_back({nowSeconds, center, baseRadius * 0.12f});
+        lastMixedSyncRippleTime_ = nowSeconds;
+    }
 
     // 時間ベースのオフセット（連続性のための）
     const float angleOffset = static_cast<float>(nowSeconds * 0.1f);
@@ -2373,12 +2393,13 @@ void ofApp::drawMixedScene(float alpha, double nowSeconds) {
         for (int octave = 0; octave < 4; ++octave) {
             const float noiseAngle = angle * noiseFrequency + noiseTime;
             const float noiseRadius = normalizedAngle * noiseFrequency * 2.0f + noiseTime * 0.3f;
-            noiseValue += noiseAmplitude * std::sin(noiseAngle * 7.0f + noiseRadius * 5.0f) * 
+            noiseValue += noiseAmplitude * std::sin(noiseAngle * 7.0f + noiseRadius * 5.0f) *
                          std::cos(noiseAngle * 11.0f + noiseRadius * 3.0f);
             noiseAmplitude *= 0.5f;
             noiseFrequency *= 2.0f;
         }
-        noiseValue *= 0.15f;  // ノイズの強度を調整（0.15 = 15%の変形）
+        const float contourRoughness = 1.0f + 0.1f * (1.0f - syncLevel);  // 非同期時に輪郭をわずかに粗く
+        noiseValue *= 0.15f * contourRoughness;  // ノイズの強度を調整（0.15 = 15%の変形）
 
         // 最終的な半径（干渉パターンによる変形 + ノイズによる有機的な変形）
         // 建設的干渉（interferenceStrengthが大きい）ほど半径が大きくなる
@@ -2400,14 +2421,15 @@ void ofApp::drawMixedScene(float alpha, double nowSeconds) {
         // 同期度が高い時: ピンク中心に統一
         const float baseHue = 0.8f + 0.1f * (1.0f - syncLevel);  // 0.8-0.9（紫-ピンク系）
         const float hueVariation = 0.4f * (1.0f - syncLevel);  // 同期度が高いほど変化が小さい（最大0.4で0.0-0.1のオレンジ範囲もカバー）
+        const float hueLfo = 0.016f * std::sin(static_cast<float>(nowSeconds) * 0.6f);  // 色相だけを揺らすLFO（±約5.7度）
 
         // 角度に基づく色相の変化
-        const float angleHue = baseHue + hueVariation * std::sin(angle * 3.0f + nowSeconds * 0.2f);
+        const float angleHue = baseHue + hueVariation * std::sin(angle * 3.0f + nowSeconds * 0.2f) + hueLfo;
 
-        // エンベロープに応じた彩度・明度
+        // 彩度・明度は同期度をベースにエンベロープでゆるやかにスケーリング
         const float envMix = ofLerp(envelopeP1, envelopeP2, (std::sin(angle) + 1.0f) * 0.5f);
-        const float saturation = 0.6f + 0.3f * envMix;
-        const float brightness = 0.55f + 0.35f * envMix;
+        const float saturation = ofLerp(0.55f, ofLerp(0.75f, 0.95f, syncLevel), envMix);
+        const float brightness = ofLerp(0.5f, ofLerp(0.75f, 0.95f, syncLevel), envMix);
 
         // 最終的な色
         const ofFloatColor color = ofFloatColor::fromHsb(
@@ -2454,7 +2476,7 @@ void ofApp::drawMixedScene(float alpha, double nowSeconds) {
     for (int layer = 0; layer < 3; ++layer) {
         const float layerSpeed = 0.3f + layer * 0.2f;
         const float layerRadius = baseRadius * (0.6f + layer * 0.15f);
-        const float layerAlpha = clampedAlpha * (1.0f - layer * 0.25f) * 0.3f;
+        float layerAlpha = clampedAlpha * (1.0f - layer * 0.25f) * 0.3f;
 
         // オーロラのような流動的な動き
         const float flowAngle = static_cast<float>(nowSeconds * layerSpeed + layer * glm::pi<float>() * 0.5f);
@@ -2467,10 +2489,19 @@ void ofApp::drawMixedScene(float alpha, double nowSeconds) {
 
         const float finalRadius = flowRadius * (0.75f + 0.25f * combinedPulse);
 
+        if (layer == 0) {
+            layerAlpha *= std::clamp(0.6f + 0.4f * averageEnvelope, 0.0f, 1.0f);
+        } else {
+            layerAlpha *= syncLevel;  // 位相差が大きいほど外層の透過度を下げる
+        }
+
         ofSetColor(255, 220, 200, static_cast<int>(layerAlpha * 255.0f));
         ofDrawCircle(center, finalRadius);
     }
     ofDisableBlendMode();
+
+    // 同期時の波紋を描画（追加フィードバック）
+    drawHeartbeatRipples(clampedAlpha * 0.35f, nowSeconds);
 
     ofPopStyle();
 }
