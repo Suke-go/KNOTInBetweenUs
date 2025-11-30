@@ -633,7 +633,7 @@ void AudioPipeline::audioOut(ofSoundBuffer& buffer) {
     }
 
     const float selfGain = dbToLinear(kSelfGainDb);
-    const float baseNoiseGain = dbToLinear(kNoiseGainDb);
+    const float baseNoiseGain = noiseGainLinear_;
 
     // Get current envelopes for dynamic noise adjustment
     const float envP1 = channelMetrics_[0].envelope;

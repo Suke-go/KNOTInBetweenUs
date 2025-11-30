@@ -122,6 +122,8 @@ private:
     float inputGainLinear_ = 1.0f;
     float targetInputGainLinear_ = 1.0f;
     float smoothedInputGainLinear_ = 1.0f;
+    float noiseGainDb_ = 0.0f;
+    float noiseGainLinear_ = 1.0f;
     static constexpr float kGainSmoothingCoeff = 0.01f;  // 約100ms @48kHz
     NoiseMode noiseMode_ = NoiseMode::Raw;
     float noiseGateThreshold_ = 0.2f;
