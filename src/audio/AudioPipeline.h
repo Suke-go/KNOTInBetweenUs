@@ -52,6 +52,7 @@ public:
     void setNoiseControlMode(NoiseMode mode);
     void setNoiseGate(float threshold, float attenuation);
     void setSpectralSubtraction(float alpha, float floor, float smoothing);
+    void setSpectralSubtractionEnabled(bool enabled);
 
     void audioIn(const ofSoundBuffer& buffer);
     void audioOut(ofSoundBuffer& buffer);
@@ -93,6 +94,8 @@ public:
         bool specSubReady = false;
         bool specSubAppliedCh1 = false;
         bool specSubAppliedCh2 = false;
+        bool specSubEnabled = true;
+        bool specSubAutoDisabled = false;
         float specSubAlpha = 0.0f;
         float specSubFloor = 0.0f;
         float specSubSmoothing = 0.0f;
@@ -125,6 +128,7 @@ private:
     float noiseGateAttenuation_ = 0.0f;
     float noiseGateGain_ = 1.0f;
     static constexpr float kNoiseGateSmoothingCoeff = 0.2f;
+    bool specSubEnabled_ = true;
     float specSubAlpha_ = 1.5f;
     float specSubFloor_ = 0.01f;
     float specSubNoiseSmoothing_ = 0.6f;
@@ -133,6 +137,7 @@ private:
     std::vector<float> specSubAmplitude_;
     std::vector<float> specSubNoiseMagSmoothed_;
     std::size_t specSubFftSize_ = 0;
+    bool specSubMissingNoiseLogged_ = false;
     BeatMetrics metrics_{};
     std::array<std::deque<BeatEvent>, 2> pendingEventsByChannel_;
     std::array<ChannelMetrics, 2> channelMetrics_{};

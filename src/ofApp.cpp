@@ -147,16 +147,23 @@ void ofApp::setup() {
     controlPanel_.add(hapticCountParam_.set("Haptic Count", 0U, 0U, 4096U));
     simulateTelemetry_ = appConfig_.enableSyntheticTelemetry;
     controlPanel_.add(simulateSignalParam_.set("Synthetic Signal", simulateTelemetry_));
-    const auto initialNoiseMode = parseNoiseMode(appConfig_.noiseMode);
+    auto initialNoiseMode = parseNoiseMode(appConfig_.noiseMode);
+    if (initialNoiseMode != knot::audio::AudioPipeline::NoiseMode::SpecSub) {
+        ofLogWarning("ofApp")
+            << "Spectrum subtraction forced ON by default. Overriding noise mode to SpecSub.";
+        initialNoiseMode = knot::audio::AudioPipeline::NoiseMode::SpecSub;
+    }
     lastNoiseMode_ = static_cast<int>(initialNoiseMode);
     lastNoiseGateThreshold_ = appConfig_.noiseGateThreshold;
     lastNoiseGateAttenuation_ = appConfig_.noiseGateAttenuation;
+    lastSpecSubEnabled_ = true;
     lastSpecSubAlpha_ = appConfig_.noiseSpecSubAlpha;
     lastSpecSubFloor_ = appConfig_.noiseSpecSubFloor;
     lastSpecSubSmoothing_ = appConfig_.noiseSpecSubSmoothing;
     controlPanel_.add(noiseModeParam_.set("Noise Mode (0=Raw,1=Gate,2=SpecSub)", lastNoiseMode_, 0, 2));
     controlPanel_.add(noiseGateThresholdParam_.set("Gate Threshold", lastNoiseGateThreshold_, 0.0f, 1.0f));
     controlPanel_.add(noiseGateAttenuationParam_.set("Gate Attenuation", lastNoiseGateAttenuation_, 0.0f, 1.0f));
+    controlPanel_.add(noiseSpecSubEnabledParam_.set("SS Enabled", lastSpecSubEnabled_));
     controlPanel_.add(noiseSpecSubAlphaParam_.set("SS Alpha", lastSpecSubAlpha_, 0.0f, 5.0f));
     controlPanel_.add(noiseSpecSubFloorParam_.set("SS Floor", lastSpecSubFloor_, 0.0f, 0.1f));
     controlPanel_.add(
@@ -206,6 +213,7 @@ void ofApp::setup() {
     audioPipeline_.setInputGainDb(appConfig_.inputGainDb);
     audioPipeline_.setNoiseControlMode(initialNoiseMode);
     audioPipeline_.setNoiseGate(lastNoiseGateThreshold_, lastNoiseGateAttenuation_);
+    audioPipeline_.setSpectralSubtractionEnabled(lastSpecSubEnabled_);
     audioPipeline_.setSpectralSubtraction(lastSpecSubAlpha_, lastSpecSubFloor_, lastSpecSubSmoothing_);
     ofLogNotice("ofApp") << "Input gain set to " << appConfig_.inputGainDb << " dB";
     audioRouter_.setup(static_cast<float>(sampleRate_));
@@ -466,6 +474,24 @@ void ofApp::update() {
         limiterReductionDbSmooth_ =
             ofLerp(limiterReductionDbSmooth_, audioPipeline_.lastLimiterReductionDb(), 0.18f);
         signalHealth_ = audioPipeline_.signalHealth();
+
+        // Auto-disable spectral subtraction if MICINPUT3 is missing and re-enable when recovered
+        const bool specSubForced = noiseModeParam_.get() == 2;
+        if (specSubForced && signalHealth_.specSubAutoDisabled && noiseSpecSubEnabledParam_.get()) {
+            noiseSpecSubEnabledParam_.set(false);
+            lastSpecSubEnabled_ = false;
+            audioPipeline_.setSpectralSubtractionEnabled(false);
+            specSubAutoDisabled_ = true;
+            ofLogWarning("ofApp")
+                << "Spectral subtraction disabled automatically: MICINPUT3 not detected.";
+        } else if (specSubForced && specSubAutoDisabled_ && !signalHealth_.specSubAutoDisabled &&
+                   !noiseSpecSubEnabledParam_.get()) {
+            noiseSpecSubEnabledParam_.set(true);
+            lastSpecSubEnabled_ = true;
+            audioPipeline_.setSpectralSubtractionEnabled(true);
+            specSubAutoDisabled_ = false;
+            ofLogNotice("ofApp") << "Spectral subtraction re-enabled: MICINPUT3 restored.";
+        }
     } else {
         // Fallback to fake signal if no metrics available or using synthetic mode
         // This ensures visible output even when there's no audio input
@@ -1648,7 +1674,7 @@ knot::audio::AudioPipeline::NoiseMode ofApp::parseNoiseMode(const std::string& m
     if (lower == "specsub" || lower == "spectral" || lower == "spec_sub") {
         return knot::audio::AudioPipeline::NoiseMode::SpecSub;
     }
-    return knot::audio::AudioPipeline::NoiseMode::Raw;
+    return knot::audio::AudioPipeline::NoiseMode::SpecSub;
 }
 
 void ofApp::applyNoiseControlParamsIfChanged() {
@@ -1677,6 +1703,14 @@ void ofApp::applyNoiseControlParamsIfChanged() {
         lastNoiseGateAttenuation_ = attenuation;
         ofLogNotice("ofApp") << "Noise gate updated - threshold: " << threshold
                               << " attenuation: " << attenuation;
+    }
+
+    const bool specSubEnabled = noiseSpecSubEnabledParam_.get();
+    if (specSubEnabled != lastSpecSubEnabled_) {
+        audioPipeline_.setSpectralSubtractionEnabled(specSubEnabled);
+        lastSpecSubEnabled_ = specSubEnabled;
+        ofLogNotice("ofApp") << "Spectral subtraction " << (specSubEnabled ? "enabled" : "disabled")
+                              << " via control panel.";
     }
 
     const float alpha = std::clamp(noiseSpecSubAlphaParam_.get(), 0.0f, 5.0f);

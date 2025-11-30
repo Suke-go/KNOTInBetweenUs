@@ -148,6 +148,7 @@ private:
     ofParameter<int> noiseModeParam_;
     ofParameter<float> noiseGateThresholdParam_;
     ofParameter<float> noiseGateAttenuationParam_;
+    ofParameter<bool> noiseSpecSubEnabledParam_;
     ofParameter<float> noiseSpecSubAlphaParam_;
     ofParameter<float> noiseSpecSubFloorParam_;
     ofParameter<float> noiseSpecSubSmoothingParam_;
@@ -247,9 +248,11 @@ private:
     int lastNoiseMode_ = 0;
     float lastNoiseGateThreshold_ = 0.2f;
     float lastNoiseGateAttenuation_ = 0.0f;
+    bool lastSpecSubEnabled_ = true;
     float lastSpecSubAlpha_ = 1.5f;
     float lastSpecSubFloor_ = 0.01f;
     float lastSpecSubSmoothing_ = 0.6f;
+    bool specSubAutoDisabled_ = false;
 
     // Bloom renderer
     BloomRenderer bloomRenderer_;

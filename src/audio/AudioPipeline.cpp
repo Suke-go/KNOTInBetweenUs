@@ -81,6 +81,8 @@ void AudioPipeline::setup(double sampleRate, std::size_t bufferSize) {
     specSubNoiseMagSmoothed_.clear();
     specSubSignalFft_.reset();
     specSubNoiseFft_.reset();
+    specSubEnabled_ = true;
+    specSubMissingNoiseLogged_ = false;
 }
 
 void AudioPipeline::setNoiseSeed(std::uint32_t seed) {
@@ -116,6 +118,11 @@ void AudioPipeline::setSpectralSubtraction(float alpha, float floor, float smoot
     specSubAlpha_ = std::clamp(alpha, 0.0f, 5.0f);
     specSubFloor_ = std::clamp(floor, 0.0f, 1.0f);
     specSubNoiseSmoothing_ = std::clamp(smoothing, 0.0f, 1.0f);
+}
+
+void AudioPipeline::setSpectralSubtractionEnabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    specSubEnabled_ = enabled;
 }
 
 void AudioPipeline::ensureBufferSizes(std::size_t numFrames) {
@@ -386,8 +393,20 @@ void AudioPipeline::audioIn(const ofSoundBuffer& buffer) {
         bool specSubApplied = false;
         bool specSubAppliedCh1 = false;
         bool specSubAppliedCh2 = false;
-        if (noiseMode_ == NoiseMode::SpecSub) {
-            if (hasNoiseChannel && ensureSpecSubFft(numFrames)) {
+        const bool specSubConfigured = noiseMode_ == NoiseMode::SpecSub && specSubEnabled_;
+        const bool specSubBlocked = specSubConfigured && !hasNoiseChannel;
+        if (specSubBlocked) {
+            if (shouldLog && !specSubMissingNoiseLogged_) {
+                ofLogWarning("AudioPipeline::audioIn")
+                    << "Spectral subtraction enabled but noise reference (MICINPUT3) not present. Disabling until available.";
+            }
+            specSubMissingNoiseLogged_ = true;
+        } else {
+            specSubMissingNoiseLogged_ = false;
+        }
+
+        if (specSubConfigured && !specSubBlocked) {
+            if (ensureSpecSubFft(numFrames)) {
                 specSubReady = true;
                 const auto bins = static_cast<std::size_t>(specSubSignalFft_->getBinSize());
                 if (specSubAmplitude_.size() < bins) {
@@ -442,8 +461,12 @@ void AudioPipeline::audioIn(const ofSoundBuffer& buffer) {
                 }
                 if (shouldLog) {
                     ofLogWarning("AudioPipeline::audioIn")
-                        << "Spectral subtraction requested but noise channel or FFT unavailable.";
+                        << "Spectral subtraction requested but FFT unavailable.";
                 }
+            }
+        } else if (specSubConfigured && specSubBlocked) {
+            if (!specSubNoiseMagSmoothed_.empty()) {
+                std::fill(specSubNoiseMagSmoothed_.begin(), specSubNoiseMagSmoothed_.end(), 0.0f);
             }
         }
         const double startSample = totalSamplesProcessed_;
@@ -568,6 +591,8 @@ void AudioPipeline::audioIn(const ofSoundBuffer& buffer) {
         signalHealth_.specSubReady = specSubReady;
         signalHealth_.specSubAppliedCh1 = specSubAppliedCh1;
         signalHealth_.specSubAppliedCh2 = specSubAppliedCh2;
+        signalHealth_.specSubEnabled = specSubEnabled_;
+        signalHealth_.specSubAutoDisabled = specSubBlocked;
         signalHealth_.specSubAlpha = specSubAlpha_;
         signalHealth_.specSubFloor = specSubFloor_;
         signalHealth_.specSubSmoothing = specSubNoiseSmoothing_;
