@@ -71,6 +71,7 @@ void AudioPipeline::setup(double sampleRate, std::size_t bufferSize) {
     legacySequenceCounter_ = 0;
     targetInputGainLinear_ = 1.0f;
     smoothedInputGainLinear_ = 1.0f;
+    setNoiseGainDb(kNoiseGainDb);
 }
 
 void AudioPipeline::setNoiseSeed(std::uint32_t seed) {
@@ -85,6 +86,12 @@ void AudioPipeline::setInputGainDb(float gainDb) {
     std::lock_guard<std::mutex> lock(mutex_);
     targetInputGainLinear_ = dbToLinear(gainDb);
     // smoothedInputGainLinear_ は audioIn() 内で段階的に更新
+}
+
+void AudioPipeline::setNoiseGainDb(float gainDb) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    noiseGainDb_ = gainDb;
+    noiseGainLinear_ = dbToLinear(gainDb);
 }
 
 void AudioPipeline::ensureBufferSizes(std::size_t numFrames) {
@@ -423,7 +430,7 @@ void AudioPipeline::audioOut(ofSoundBuffer& buffer) {
     }
 
     const float selfGain = dbToLinear(kSelfGainDb);
-    const float baseNoiseGain = dbToLinear(kNoiseGainDb);
+    const float baseNoiseGain = noiseGainLinear_;
 
     // Get current envelopes for dynamic noise adjustment
     const float envP1 = channelMetrics_[0].envelope;

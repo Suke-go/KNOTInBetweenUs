@@ -49,6 +49,8 @@ private:
     void onEndButtonPressed();
     void onResetButtonPressed();
     void onEnvelopeCalibrationButtonPressed();
+    void onInputGainChanged(float& gainDb);
+    void onNoiseGainChanged(float& gainDb);
 
     // Update helpers
     void updateSceneGui(double nowSeconds);
@@ -143,6 +145,8 @@ private:
    ofParameter<float> envelopeP2Param_;
     ofParameter<std::uint32_t> hapticCountParam_;
     ofParameter<bool> simulateSignalParam_;
+    ofParameter<float> inputGainDbParam_;
+    ofParameter<float> noiseGainDbParam_;
     ofxButton startButton_;
     ofxButton endButton_;
     ofxButton resetButton_;

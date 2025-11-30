@@ -44,13 +44,14 @@ struct AppConfig {
 	std::filesystem::path calibrationPath;
 	std::filesystem::path calibrationReportCsvPath;
 	std::filesystem::path sessionSeedPath;
-	bool enableSyntheticTelemetry = false;
-	std::string defaultScene = "Idle";
-	std::string operationMode = "debug";
-	float inputGainDb = 0.0f;
-	GuiConfig gui;
-	std::filesystem::path sceneTimingConfigPath;
-	std::filesystem::path sceneTransitionCsvPath;
+        bool enableSyntheticTelemetry = false;
+        std::string defaultScene = "Idle";
+        std::string operationMode = "debug";
+        float inputGainDb = 0.0f;
+        float noiseGainDb = -23.0f;
+        GuiConfig gui;
+        std::filesystem::path sceneTimingConfigPath;
+        std::filesystem::path sceneTransitionCsvPath;
 };
 
 class AppConfigLoader {

@@ -147,6 +147,8 @@ void ofApp::setup() {
     controlPanel_.add(hapticCountParam_.set("Haptic Count", 0U, 0U, 4096U));
     simulateTelemetry_ = appConfig_.enableSyntheticTelemetry;
     controlPanel_.add(simulateSignalParam_.set("Synthetic Signal", simulateTelemetry_));
+    controlPanel_.add(inputGainDbParam_.set("Mic Gain (dB)", appConfig_.inputGainDb, -12.0f, 36.0f));
+    controlPanel_.add(noiseGainDbParam_.set("Pink Noise (dB)", appConfig_.noiseGainDb, -36.0f, -6.0f));
     controlPanel_.add(startButton_.setup("Start Sequence"));
     controlPanel_.add(endButton_.setup("Trigger End"));
     controlPanel_.add(resetButton_.setup("Reset to Idle"));
@@ -164,6 +166,8 @@ void ofApp::setup() {
     endButton_.addListener(this, &ofApp::onEndButtonPressed);
     resetButton_.addListener(this, &ofApp::onResetButtonPressed);
     envelopeCalibrationButton_.addListener(this, &ofApp::onEnvelopeCalibrationButtonPressed);
+    inputGainDbParam_.addListener(this, &ofApp::onInputGainChanged);
+    noiseGainDbParam_.addListener(this, &ofApp::onNoiseGainChanged);
     refreshDevicesButton_.addListener(this, &ofApp::onRefreshAudioDevices);
     prevInputDeviceButton_.addListener(this, &ofApp::onPrevInputDevice);
     nextInputDeviceButton_.addListener(this, &ofApp::onNextInputDevice);
@@ -190,7 +194,9 @@ void ofApp::setup() {
     audioPipeline_.setup(sampleRate_, bufferSize_);
     audioPipeline_.loadCalibrationFile(calibrationFilePath_);
     audioPipeline_.setInputGainDb(appConfig_.inputGainDb);
+    audioPipeline_.setNoiseGainDb(appConfig_.noiseGainDb);
     ofLogNotice("ofApp") << "Input gain set to " << appConfig_.inputGainDb << " dB";
+    ofLogNotice("ofApp") << "Pink noise level set to " << appConfig_.noiseGainDb << " dB";
     audioRouter_.setup(static_cast<float>(sampleRate_));
     audioRouter_.applyScenePreset(sceneController_.currentState());
     ofLogNotice("ofApp") << "AudioRouter initialised with scene preset: "
@@ -622,6 +628,8 @@ void ofApp::exit() {
     endButton_.removeListener(this, &ofApp::onEndButtonPressed);
     resetButton_.removeListener(this, &ofApp::onResetButtonPressed);
     envelopeCalibrationButton_.removeListener(this, &ofApp::onEnvelopeCalibrationButtonPressed);
+    inputGainDbParam_.removeListener(this, &ofApp::onInputGainChanged);
+    noiseGainDbParam_.removeListener(this, &ofApp::onNoiseGainChanged);
     refreshDevicesButton_.removeListener(this, &ofApp::onRefreshAudioDevices);
     prevInputDeviceButton_.removeListener(this, &ofApp::onPrevInputDevice);
     nextInputDeviceButton_.removeListener(this, &ofApp::onNextInputDevice);
@@ -950,6 +958,16 @@ void ofApp::onEnvelopeCalibrationButtonPressed() {
     if (simulateTelemetry_) {
         ofLogWarning("ofApp") << "Synthetic signalが有効な状態で包絡キャリブを開始しました。実入力に切り替えることを推奨します。";
     }
+}
+
+void ofApp::onInputGainChanged(float& gainDb) {
+    audioPipeline_.setInputGainDb(gainDb);
+    ofLogNotice("ofApp") << "Mic gain adjusted to " << gainDb << " dB";
+}
+
+void ofApp::onNoiseGainChanged(float& gainDb) {
+    audioPipeline_.setNoiseGainDb(gainDb);
+    ofLogNotice("ofApp") << "Pink noise level adjusted to " << gainDb << " dB";
 }
 
 void ofApp::updateSceneGui(double nowSeconds) {
