@@ -148,7 +148,7 @@ void ofApp::setup() {
     simulateTelemetry_ = appConfig_.enableSyntheticTelemetry;
     controlPanel_.add(simulateSignalParam_.set("Synthetic Signal", simulateTelemetry_));
     controlPanel_.add(inputGainDbParam_.set("Mic Gain (dB)", appConfig_.inputGainDb, -12.0f, 36.0f));
-    controlPanel_.add(noiseGainDbParam_.set("Pink Noise (dB)", appConfig_.noiseGainDb, -36.0f, -6.0f));
+    controlPanel_.add(noiseGainDbParam_.set("Pink Noise (Generated, dB)", appConfig_.noiseGainDb, -36.0f, -6.0f));
     controlPanel_.add(startButton_.setup("Start Sequence"));
     controlPanel_.add(endButton_.setup("Trigger End"));
     controlPanel_.add(resetButton_.setup("Reset to Idle"));
@@ -196,7 +196,7 @@ void ofApp::setup() {
     audioPipeline_.setInputGainDb(appConfig_.inputGainDb);
     audioPipeline_.setNoiseGainDb(appConfig_.noiseGainDb);
     ofLogNotice("ofApp") << "Input gain set to " << appConfig_.inputGainDb << " dB";
-    ofLogNotice("ofApp") << "Pink noise level set to " << appConfig_.noiseGainDb << " dB";
+    ofLogNotice("ofApp") << "Generated pink noise level set to " << appConfig_.noiseGainDb << " dB";
     audioRouter_.setup(static_cast<float>(sampleRate_));
     audioRouter_.applyScenePreset(sceneController_.currentState());
     ofLogNotice("ofApp") << "AudioRouter initialised with scene preset: "
@@ -967,7 +967,7 @@ void ofApp::onInputGainChanged(float& gainDb) {
 
 void ofApp::onNoiseGainChanged(float& gainDb) {
     audioPipeline_.setNoiseGainDb(gainDb);
-    ofLogNotice("ofApp") << "Pink noise level adjusted to " << gainDb << " dB";
+    ofLogNotice("ofApp") << "Generated pink noise level adjusted to " << gainDb << " dB";
 }
 
 void ofApp::updateSceneGui(double nowSeconds) {
