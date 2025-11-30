@@ -99,6 +99,12 @@ void AudioPipeline::setInputGainDb(float gainDb) {
     // smoothedInputGainLinear_ は audioIn() 内で段階的に更新
 }
 
+void AudioPipeline::setNoiseGainDb(float gainDb) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    noiseGainDb_ = gainDb;
+    noiseGainLinear_ = dbToLinear(gainDb);
+}
+
 void AudioPipeline::setNoiseControlMode(NoiseMode mode) {
     std::lock_guard<std::mutex> lock(mutex_);
     noiseMode_ = mode;

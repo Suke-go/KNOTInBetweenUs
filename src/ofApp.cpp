@@ -144,6 +144,8 @@ void ofApp::setup() {
     controlPanel_.add(bpmP2Param_.set("BPM P2", 0.0f, 0.0f, 240.0f));
     controlPanel_.add(envelopeP1Param_.set("Env P1", 0.0f, 0.0f, 1.0f));
     controlPanel_.add(envelopeP2Param_.set("Env P2", 0.0f, 0.0f, 1.0f));
+    controlPanel_.add(inputGainDbParam_.set("Mic Gain (dB)", appConfig_.inputGainDb, -24.0f, 36.0f));
+    controlPanel_.add(noiseGainDbParam_.set("Noise Gain (dB)", appConfig_.noiseGainDb, -60.0f, 24.0f));
     controlPanel_.add(hapticCountParam_.set("Haptic Count", 0U, 0U, 4096U));
     simulateTelemetry_ = appConfig_.enableSyntheticTelemetry;
     controlPanel_.add(simulateSignalParam_.set("Synthetic Signal", simulateTelemetry_));
@@ -213,6 +215,7 @@ void ofApp::setup() {
     audioPipeline_.setup(sampleRate_, bufferSize_);
     audioPipeline_.loadCalibrationFile(calibrationFilePath_);
     audioPipeline_.setInputGainDb(appConfig_.inputGainDb);
+    audioPipeline_.setNoiseGainDb(appConfig_.noiseGainDb);
     audioPipeline_.setNoiseControlMode(initialNoiseMode);
     audioPipeline_.setNoiseGate(lastNoiseGateThreshold_, lastNoiseGateAttenuation_);
     audioPipeline_.setSpectralSubtractionEnabled(lastSpecSubEnabled_);

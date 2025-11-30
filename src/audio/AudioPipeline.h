@@ -49,6 +49,7 @@ public:
     EnvelopeCalibrationStats lastEnvelopeCalibration() const;
     bool pollEnvelopeCalibrationStats(EnvelopeCalibrationStats& stats);
     void setInputGainDb(float gainDb);
+    void setNoiseGainDb(float gainDb);
     void setNoiseControlMode(NoiseMode mode);
     void setNoiseGate(float threshold, float attenuation);
     void setSpectralSubtraction(float alpha, float floor, float smoothing);

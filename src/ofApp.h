@@ -145,6 +145,8 @@ private:
    ofParameter<float> bpmP2Param_;
    ofParameter<float> envelopeP1Param_;
    ofParameter<float> envelopeP2Param_;
+    ofParameter<float> inputGainDbParam_;
+    ofParameter<float> noiseGainDbParam_;
     ofParameter<std::uint32_t> hapticCountParam_;
     ofParameter<bool> simulateSignalParam_;
     ofParameter<int> noiseModeParam_;
