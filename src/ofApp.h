@@ -247,6 +247,7 @@ private:
     std::vector<Ripple> ripples_;
     double lastExchangeRippleTime1_ = 0.0;
     double lastExchangeRippleTime2_ = 0.0;
+    double lastMixedSyncRippleTime_ = 0.0;
 
     // Synthetic heartbeat generation
     std::array<SyntheticHeartbeatGenerator, 2> syntheticHeartbeatGenerators_;
