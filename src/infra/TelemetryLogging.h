@@ -48,7 +48,7 @@ struct AppConfig {
         std::string defaultScene = "Idle";
         std::string operationMode = "debug";
         float inputGainDb = 0.0f;
-        std::string noiseMode = "raw";
+        std::string noiseMode = "specsub";
         float noiseGateThreshold = 0.2f;
         float noiseGateAttenuation = 0.0f;
         float noiseSpecSubAlpha = 1.5f;

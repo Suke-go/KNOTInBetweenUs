@@ -99,7 +99,7 @@ AppConfig AppConfigLoader::load(const std::filesystem::path& configRelativePath)
         config.defaultScene = json.value("defaultScene", "Idle");
         config.operationMode = json.value("operationMode", "debug");
         config.inputGainDb = json.value("inputGainDb", 0.0f);
-        config.noiseMode = ofToLower(json.value("noiseMode", "raw"));
+        config.noiseMode = ofToLower(json.value("noiseMode", "specsub"));
         config.noiseGateThreshold = json.value("noiseGateThreshold", 0.2f);
         config.noiseGateAttenuation = json.value("noiseGateAttenuation", 0.0f);
         config.noiseSpecSubAlpha = json.value("noiseSpecSubAlpha", 1.5f);
@@ -153,7 +153,7 @@ ofJson AppConfigLoader::makeDefaultConfig(const std::filesystem::path& absoluteP
                         {"defaultScene", "Idle"},
                         {"operationMode", "debug"},
                         {"inputGainDb", 0.0},
-                        {"noiseMode", "raw"},
+                        {"noiseMode", "specsub"},
                         {"noiseGateThreshold", 0.2},
                         {"noiseGateAttenuation", 0.0},
                         {"noiseSpecSubAlpha", 1.5},
