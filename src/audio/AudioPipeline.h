@@ -41,6 +41,7 @@ public:
     EnvelopeCalibrationStats lastEnvelopeCalibration() const;
     bool pollEnvelopeCalibrationStats(EnvelopeCalibrationStats& stats);
     void setInputGainDb(float gainDb);
+    void setNoiseGainDb(float gainDb);
 
     void audioIn(const ofSoundBuffer& buffer);
     void audioOut(ofSoundBuffer& buffer);
@@ -96,6 +97,8 @@ private:
     float inputGainLinear_ = 1.0f;
     float targetInputGainLinear_ = 1.0f;
     float smoothedInputGainLinear_ = 1.0f;
+    float noiseGainDb_ = 0.0f;
+    float noiseGainLinear_ = 1.0f;
     static constexpr float kGainSmoothingCoeff = 0.01f;  // 約100ms @48kHz
     BeatMetrics metrics_{};
     std::array<std::deque<BeatEvent>, 2> pendingEventsByChannel_;

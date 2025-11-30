@@ -95,15 +95,16 @@ AppConfig AppConfigLoader::load(const std::filesystem::path& configRelativePath)
 	config.calibrationReportCsvPath =
 		makeAbsolute(std::filesystem::path(json.value("calibrationReportCsv", "../logs/calibration_report.csv")));
 	config.sessionSeedPath = makeAbsolute(std::filesystem::path(json.value("sessionSeed", "config/session_seed.json")));
-	config.enableSyntheticTelemetry = json.value("enableSyntheticTelemetry", false);
-	config.defaultScene = json.value("defaultScene", "Idle");
-	config.operationMode = json.value("operationMode", "debug");
-	config.inputGainDb = json.value("inputGainDb", 0.0f);
+        config.enableSyntheticTelemetry = json.value("enableSyntheticTelemetry", false);
+        config.defaultScene = json.value("defaultScene", "Idle");
+        config.operationMode = json.value("operationMode", "debug");
+        config.inputGainDb = json.value("inputGainDb", 0.0f);
+        config.noiseGainDb = json.value("noiseGainDb", -23.0f);
 
-	const auto guiJson = json.value("gui", ofJson::object());
-	config.gui.showControlPanel = guiJson.value("showControlPanel", true);
-	config.gui.showStatusPanel = guiJson.value("showStatusPanel", true);
-	config.gui.allowKeyboardToggle = guiJson.value("allowKeyboardToggle", true);
+        const auto guiJson = json.value("gui", ofJson::object());
+        config.gui.showControlPanel = guiJson.value("showControlPanel", true);
+        config.gui.showStatusPanel = guiJson.value("showStatusPanel", true);
+        config.gui.allowKeyboardToggle = guiJson.value("allowKeyboardToggle", true);
 	config.gui.keyboardToggleKey = guiJson.value("keyboardToggleKey", "g");
 	config.gui.keyboardToggleHoldTime = guiJson.value("keyboardToggleHoldTime", 0.0);
 	config.gui.allowCornerUnlock = guiJson.value("allowCornerUnlock", false);
@@ -143,15 +144,16 @@ ofJson AppConfigLoader::makeDefaultConfig(const std::filesystem::path& absoluteP
 			{"calibrationPath", "../calibration/channel_separator.json"},
 			{"calibrationReportCsv", "../logs/calibration_report.csv"},
 			{"sessionSeed", "config/session_seed.json"},
-			{"enableSyntheticTelemetry", false},
-			{"defaultScene", "Idle"},
-			{"operationMode", "debug"},
-			{"inputGainDb", 0.0},
-			{"gui",
-			 {
-				 {"showControlPanel", true},
-				 {"showStatusPanel", true},
-				 {"allowKeyboardToggle", true},
+                        {"enableSyntheticTelemetry", false},
+                        {"defaultScene", "Idle"},
+                        {"operationMode", "debug"},
+                        {"inputGainDb", 0.0},
+                        {"noiseGainDb", -23.0},
+                        {"gui",
+                         {
+                                 {"showControlPanel", true},
+                                 {"showStatusPanel", true},
+                                 {"allowKeyboardToggle", true},
 				 {"keyboardToggleKey", "g"},
 				 {"keyboardToggleHoldTime", 0.0},
 				 {"allowCornerUnlock", false},
