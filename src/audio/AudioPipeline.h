@@ -7,7 +7,6 @@
 #include "SimpleLimiter.h"
 #include "Utility.h"
 #include "BiquadFilter.h"
-#include "CrossCorrelationNoiseReducer.h"
 
 #include "ofSoundBuffer.h"
 
@@ -15,16 +14,25 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <random>
 #include <string>
 #include <vector>
 
+class ofxFft;
+
 namespace knot::audio {
 
 class AudioPipeline {
 public:
+    enum class NoiseMode {
+        Raw = 0,
+        Gate = 1,
+        SpecSub = 2,
+    };
+
     void setup(double sampleRate, std::size_t bufferSize);
     void loadCalibrationFile(const std::filesystem::path& path);
     bool saveCalibrationFile(const std::filesystem::path& path) const;
@@ -41,6 +49,9 @@ public:
     EnvelopeCalibrationStats lastEnvelopeCalibration() const;
     bool pollEnvelopeCalibrationStats(EnvelopeCalibrationStats& stats);
     void setInputGainDb(float gainDb);
+    void setNoiseControlMode(NoiseMode mode);
+    void setNoiseGate(float threshold, float attenuation);
+    void setSpectralSubtraction(float alpha, float floor, float smoothing);
 
     void audioIn(const ofSoundBuffer& buffer);
     void audioOut(ofSoundBuffer& buffer);
@@ -74,6 +85,17 @@ public:
         bool fallbackActive = false;
         float fallbackBlend = 0.0f;
         float fallbackEnvelope = 0.0f;
+        float noiseRms = 0.0f;
+        bool noiseChannelPresent = false;
+        float noiseGateGain = 1.0f;
+        bool noiseGateEngaged = false;
+        bool specSubActive = false;
+        bool specSubReady = false;
+        bool specSubAppliedCh1 = false;
+        bool specSubAppliedCh2 = false;
+        float specSubAlpha = 0.0f;
+        float specSubFloor = 0.0f;
+        float specSubSmoothing = 0.0f;
     };
     SignalHealth signalHealth() const;
 
@@ -90,13 +112,27 @@ private:
     SimpleLimiter limiter_{};
 
     mutable std::mutex mutex_;
-    std::array<std::vector<float>, 2> channelBuffers_;
+    std::array<std::vector<float>, 3> channelBuffers_;
     std::vector<float> outputScratch_;
+    std::vector<float> inputStereoScratch_;
     std::array<PinkNoiseFilter, 2> pinkNoiseFilters_;  // Stereo pink noise (L/R)
     float inputGainLinear_ = 1.0f;
     float targetInputGainLinear_ = 1.0f;
     float smoothedInputGainLinear_ = 1.0f;
     static constexpr float kGainSmoothingCoeff = 0.01f;  // 約100ms @48kHz
+    NoiseMode noiseMode_ = NoiseMode::Raw;
+    float noiseGateThreshold_ = 0.2f;
+    float noiseGateAttenuation_ = 0.0f;
+    float noiseGateGain_ = 1.0f;
+    static constexpr float kNoiseGateSmoothingCoeff = 0.2f;
+    float specSubAlpha_ = 1.5f;
+    float specSubFloor_ = 0.01f;
+    float specSubNoiseSmoothing_ = 0.6f;
+    std::unique_ptr<ofxFft> specSubSignalFft_;
+    std::unique_ptr<ofxFft> specSubNoiseFft_;
+    std::vector<float> specSubAmplitude_;
+    std::vector<float> specSubNoiseMagSmoothed_;
+    std::size_t specSubFftSize_ = 0;
     BeatMetrics metrics_{};
     std::array<std::deque<BeatEvent>, 2> pendingEventsByChannel_;
     std::array<ChannelMetrics, 2> channelMetrics_{};
@@ -126,13 +162,12 @@ private:
     // High-pass to remove sub-bass/rumble when input is poor
     BiquadFilter rumbleHighPass_[2]{};
     // Notch filter to remove power line noise (50/60Hz)
-    std::array<BiquadFilter, 2> notchFilters_{};
-    // Cross-correlation based noise reducer to remove common environmental noise
-    CrossCorrelationNoiseReducer noiseReducer_;
+    std::array<BiquadFilter, 3> notchFilters_{};
 
     void applyCalibration(float& ch1, float& ch2) const;
     void ensureBufferSizes(std::size_t numFrames);
     static std::optional<std::size_t> participantIndex(ParticipantId id);
+    bool ensureSpecSubFft(std::size_t fftSize);
 };
 
 } // namespace knot::audio

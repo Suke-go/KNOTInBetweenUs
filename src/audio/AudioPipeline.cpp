@@ -1,17 +1,21 @@
 #include "AudioPipeline.h"
 
 #include "Utility.h"
+#include "ofxFft.h"
 
 #include "ofMain.h"
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 
 namespace knot::audio {
 
 namespace {
 constexpr float kSelfGainDb = -16.0f;
 constexpr float kNoiseGainDb = -23.0f;
+constexpr std::size_t kParticipantChannels = 2;
+constexpr std::size_t kNoiseChannelIndex = 2;
 } // namespace
 
 void AudioPipeline::setup(double sampleRate, std::size_t bufferSize) {
@@ -39,9 +43,9 @@ void AudioPipeline::setup(double sampleRate, std::size_t bufferSize) {
     // Setup notch filters to remove power line noise (50Hz, Q=10.0 for narrow notch)
     notchFilters_[0].setup(BiquadFilter::Type::Notch, sampleRate_, 50.0, 10.0);
     notchFilters_[1].setup(BiquadFilter::Type::Notch, sampleRate_, 50.0, 10.0);
-    // Setup cross-correlation noise reducer
-    noiseReducer_.setup(sampleRate_);
+    notchFilters_[2].setup(BiquadFilter::Type::Notch, sampleRate_, 50.0, 10.0);
     outputScratch_.assign(bufferSize_ * 2, 0.0f);
+    inputStereoScratch_.assign(bufferSize_ * 2, 0.0f);
     totalSamplesProcessed_ = 0.0;
     limiterReductionDb_ = 0.0f;
     lastEnvelopeCalibration_ = {};
@@ -51,6 +55,7 @@ void AudioPipeline::setup(double sampleRate, std::size_t bufferSize) {
     envelopeMidAvg_ = 0.0f;
     envelopeLongAvg_ = 0.0f;
     bpmAvg_ = 0.0f;
+    noiseGateGain_ = 1.0f;
     lastRealBeatSample_ = 0.0;
     lastHealthUpdateSec_ = 0.0;
     fallbackActive_ = false;
@@ -71,6 +76,11 @@ void AudioPipeline::setup(double sampleRate, std::size_t bufferSize) {
     legacySequenceCounter_ = 0;
     targetInputGainLinear_ = 1.0f;
     smoothedInputGainLinear_ = 1.0f;
+    specSubFftSize_ = 0;
+    specSubAmplitude_.clear();
+    specSubNoiseMagSmoothed_.clear();
+    specSubSignalFft_.reset();
+    specSubNoiseFft_.reset();
 }
 
 void AudioPipeline::setNoiseSeed(std::uint32_t seed) {
@@ -87,6 +97,27 @@ void AudioPipeline::setInputGainDb(float gainDb) {
     // smoothedInputGainLinear_ は audioIn() 内で段階的に更新
 }
 
+void AudioPipeline::setNoiseControlMode(NoiseMode mode) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    noiseMode_ = mode;
+    if (noiseMode_ != NoiseMode::Gate) {
+        noiseGateGain_ = 1.0f;
+    }
+}
+
+void AudioPipeline::setNoiseGate(float threshold, float attenuation) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    noiseGateThreshold_ = std::max(0.0f, threshold);
+    noiseGateAttenuation_ = std::clamp(attenuation, 0.0f, 1.0f);
+}
+
+void AudioPipeline::setSpectralSubtraction(float alpha, float floor, float smoothing) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    specSubAlpha_ = std::clamp(alpha, 0.0f, 5.0f);
+    specSubFloor_ = std::clamp(floor, 0.0f, 1.0f);
+    specSubNoiseSmoothing_ = std::clamp(smoothing, 0.0f, 1.0f);
+}
+
 void AudioPipeline::ensureBufferSizes(std::size_t numFrames) {
     for (auto& channelBuffer : channelBuffers_) {
         if (channelBuffer.size() < numFrames) {
@@ -96,6 +127,39 @@ void AudioPipeline::ensureBufferSizes(std::size_t numFrames) {
     if (outputScratch_.size() < numFrames * 4) {
         outputScratch_.assign(numFrames * 4, 0.0f);
     }
+    if (inputStereoScratch_.size() < numFrames * 2) {
+        inputStereoScratch_.assign(numFrames * 2, 0.0f);
+    }
+}
+
+bool AudioPipeline::ensureSpecSubFft(std::size_t fftSize) {
+    if (fftSize == 0) {
+        return false;
+    }
+    if (specSubFftSize_ == fftSize && specSubSignalFft_ && specSubNoiseFft_) {
+        return true;
+    }
+
+    specSubSignalFft_.reset();
+    specSubNoiseFft_.reset();
+    specSubAmplitude_.clear();
+    specSubNoiseMagSmoothed_.clear();
+
+    specSubSignalFft_.reset(ofxFft::create(static_cast<int>(fftSize), OF_FFT_WINDOW_HAMMING));
+    specSubNoiseFft_.reset(ofxFft::create(static_cast<int>(fftSize), OF_FFT_WINDOW_HAMMING));
+
+    if (!specSubSignalFft_ || !specSubNoiseFft_) {
+        ofLogError("AudioPipeline::ensureSpecSubFft")
+            << "Failed to initialize FFT for spectral subtraction with size " << fftSize;
+        specSubFftSize_ = 0;
+        return false;
+    }
+
+    specSubFftSize_ = fftSize;
+    const auto bins = static_cast<std::size_t>(specSubSignalFft_->getBinSize());
+    specSubAmplitude_.assign(bins, 0.0f);
+    specSubNoiseMagSmoothed_.assign(bins, 0.0f);
+    return true;
 }
 
 void AudioPipeline::loadCalibrationFile(const std::filesystem::path& path) {
@@ -119,7 +183,6 @@ void AudioPipeline::startCalibration() {
     calibrationArmed_ = true;
     calibrationCompleted_ = false;
     limiter_.reset();
-    noiseReducer_.reset();
     beatTimelines_[0].setup(sampleRate_, ParticipantId::Participant1);
     beatTimelines_[1].setup(sampleRate_, ParticipantId::Participant2);
     metrics_ = {};
@@ -204,14 +267,17 @@ void AudioPipeline::audioIn(const ofSoundBuffer& buffer) {
     audioPipelineInCallCount++;
     const bool shouldLog = (audioPipelineInCallCount % 100 == 0);
     
-    if (buffer.getNumChannels() < 2 || numFrames == 0) {
+    if (buffer.getNumChannels() < kParticipantChannels || numFrames == 0) {
         if (shouldLog) {
-            ofLogWarning("AudioPipeline::audioIn") << "Invalid input buffer - channels: " 
-                                                    << buffer.getNumChannels() 
+            ofLogWarning("AudioPipeline::audioIn") << "Invalid input buffer - channels: "
+                                                    << buffer.getNumChannels()
                                                     << ", frames: " << numFrames;
         }
         return;
     }
+
+    const std::size_t inputChannels = buffer.getNumChannels();
+    const bool hasNoiseChannel = inputChannels > kNoiseChannelIndex;
     
     if (shouldLog) {
         ofLogNotice("AudioPipeline::audioIn") << "=== AudioPipeline Input Debug (call " << audioPipelineInCallCount << ") ===";
@@ -232,45 +298,153 @@ void AudioPipeline::audioIn(const ofSoundBuffer& buffer) {
     
     // Debug: Log input signal level periodically (calculate before processing)
     if (shouldLog) {
-        float maxCh1 = 0.0f, maxCh2 = 0.0f;
-        float rmsCh1 = 0.0f, rmsCh2 = 0.0f;
+        float maxCh1 = 0.0f, maxCh2 = 0.0f, maxNoise = 0.0f;
+        float rmsCh1 = 0.0f, rmsCh2 = 0.0f, rmsNoise = 0.0f;
         for (std::size_t frame = 0; frame < numFrames; ++frame) {
-            const float ch1 = input[frame * 2];
-            const float ch2 = input[frame * 2 + 1];
+            const float ch1 = input[frame * inputChannels];
+            const float ch2 = input[frame * inputChannels + 1];
+            const float noise = hasNoiseChannel ? input[frame * inputChannels + kNoiseChannelIndex] : 0.0f;
             maxCh1 = std::max(maxCh1, std::fabs(ch1));
             maxCh2 = std::max(maxCh2, std::fabs(ch2));
+            maxNoise = std::max(maxNoise, std::fabs(noise));
             rmsCh1 += ch1 * ch1;
             rmsCh2 += ch2 * ch2;
+            rmsNoise += noise * noise;
         }
         rmsCh1 = std::sqrt(rmsCh1 / numFrames);
         rmsCh2 = std::sqrt(rmsCh2 / numFrames);
+        rmsNoise = std::sqrt(rmsNoise / numFrames);
         ofLogNotice("AudioPipeline::audioIn") << "Raw input level - CH1: max=" << maxCh1 << " rms=" << rmsCh1
-                                               << " | CH2: max=" << maxCh2 << " rms=" << rmsCh2;
+                                               << " | CH2: max=" << maxCh2 << " rms=" << rmsCh2
+                                               << (hasNoiseChannel ? " | CH3(noise): max=" + ofToString(maxNoise) + " rms=" +
+                                                                         ofToString(rmsNoise)
+                                                                  : " | CH3(noise): N/A");
         ofLogNotice("AudioPipeline::audioIn") << "inputGainLinear_: " << inputGainLinear_;
     }
 
     if (calibrationArmed_) {
-        calibrationSession_.capture(input, numFrames);
+        const float* calibrationInput = input;
+        if (inputChannels > kParticipantChannels) {
+            for (std::size_t frame = 0; frame < numFrames; ++frame) {
+                inputStereoScratch_[frame * 2] = input[frame * inputChannels];
+                inputStereoScratch_[frame * 2 + 1] = input[frame * inputChannels + 1];
+            }
+            calibrationInput = inputStereoScratch_.data();
+        }
+        calibrationSession_.capture(calibrationInput, numFrames);
         totalSamplesProcessed_ += static_cast<double>(numFrames);
         signalHealth_ = {};
     } else {
         const bool wasEnvelopeCalibrating = beatTimelines_[0].isEnvelopeCalibrating();
+        double noiseSumSquares = 0.0;
         for (std::size_t frame = 0; frame < numFrames; ++frame) {
-            float ch1 = input[frame * 2];
-            float ch2 = input[frame * 2 + 1];
+            float ch1 = input[frame * inputChannels];
+            float ch2 = input[frame * inputChannels + 1];
+            float noiseRef = hasNoiseChannel ? input[frame * inputChannels + kNoiseChannelIndex] : 0.0f;
             // Apply notch filter to remove power line noise (50/60Hz)
             ch1 = notchFilters_[0].process(ch1);
             ch2 = notchFilters_[1].process(ch2);
-            // Apply cross-correlation based noise reduction
-            // Removes common environmental noise while preserving independent heartbeat signals
-            noiseReducer_.process(ch1, ch2);
+            noiseRef = notchFilters_[2].process(noiseRef);
             if (inputGainLinear_ != 1.0f) {
                 ch1 = std::clamp(ch1 * inputGainLinear_, -1.0f, 1.0f);
                 ch2 = std::clamp(ch2 * inputGainLinear_, -1.0f, 1.0f);
+                noiseRef = std::clamp(noiseRef * inputGainLinear_, -1.0f, 1.0f);
             }
             applyCalibration(ch1, ch2);
             channelBuffers_[0][frame] = ch1;
             channelBuffers_[1][frame] = ch2;
+            channelBuffers_[kNoiseChannelIndex][frame] = noiseRef;
+            noiseSumSquares += static_cast<double>(noiseRef) * static_cast<double>(noiseRef);
+        }
+        const float noiseRms = hasNoiseChannel && numFrames > 0
+                                   ? static_cast<float>(std::sqrt(noiseSumSquares / numFrames))
+                                   : 0.0f;
+
+        // Apply side-chain noise gate (Phase 1 safety) when enabled
+        float targetGateGain = 1.0f;
+        bool gateEngaged = false;
+        if (noiseMode_ == NoiseMode::Gate && hasNoiseChannel) {
+            if (noiseRms > noiseGateThreshold_) {
+                targetGateGain = noiseGateAttenuation_;
+                gateEngaged = true;
+            }
+        }
+        noiseGateGain_ = noiseGateGain_ +
+                         kNoiseGateSmoothingCoeff * (targetGateGain - noiseGateGain_);
+        if (std::fabs(noiseGateGain_ - targetGateGain) < 1e-4f) {
+            noiseGateGain_ = targetGateGain;
+        }
+        if (noiseGateGain_ < 0.999f) {
+            for (std::size_t frame = 0; frame < numFrames; ++frame) {
+                channelBuffers_[0][frame] *= noiseGateGain_;
+                channelBuffers_[1][frame] *= noiseGateGain_;
+            }
+        }
+
+        // Spectral subtraction (Phase 2) when explicitly enabled and CH3 is present
+        bool specSubReady = false;
+        bool specSubApplied = false;
+        bool specSubAppliedCh1 = false;
+        bool specSubAppliedCh2 = false;
+        if (noiseMode_ == NoiseMode::SpecSub) {
+            if (hasNoiseChannel && ensureSpecSubFft(numFrames)) {
+                specSubReady = true;
+                const auto bins = static_cast<std::size_t>(specSubSignalFft_->getBinSize());
+                if (specSubAmplitude_.size() < bins) {
+                    specSubAmplitude_.assign(bins, 0.0f);
+                }
+                if (specSubNoiseMagSmoothed_.size() < bins) {
+                    specSubNoiseMagSmoothed_.assign(bins, 0.0f);
+                }
+
+                // Noise FFT (shared across participant channels)
+                specSubNoiseFft_->setSignal(channelBuffers_[kNoiseChannelIndex].data());
+                const float* noiseAmplitude = specSubNoiseFft_->getAmplitude();
+                const float smooth = specSubNoiseSmoothing_;
+                for (std::size_t i = 0; i < bins; ++i) {
+                    const float noiseMag = noiseAmplitude[i];
+                    float& smoothed = specSubNoiseMagSmoothed_[i];
+                    if (smooth > 0.0f) {
+                        smoothed = smoothed + smooth * (noiseMag - smoothed);
+                    } else {
+                        smoothed = noiseMag;
+                    }
+                }
+
+                // Apply spectral subtraction to each participant channel independently
+                for (std::size_t channel = 0; channel < kParticipantChannels; ++channel) {
+                    specSubSignalFft_->setSignal(channelBuffers_[channel].data());
+                    const float* signalAmplitude = specSubSignalFft_->getAmplitude();
+                    const float* signalPhase = specSubSignalFft_->getPhase();
+
+                    for (std::size_t i = 0; i < bins; ++i) {
+                        float magnitude = signalAmplitude[i] - specSubAlpha_ * specSubNoiseMagSmoothed_[i];
+                        magnitude = std::max(magnitude, specSubFloor_);
+                        specSubAmplitude_[i] = magnitude;
+                    }
+
+                    specSubSignalFft_->setPolar(specSubAmplitude_.data(), signalPhase);
+                    float* reconstructed = specSubSignalFft_->getSignal();
+                    for (std::size_t frame = 0; frame < numFrames; ++frame) {
+                        float sample = reconstructed[frame];
+                        if (!std::isfinite(sample)) {
+                            sample = 0.0f;
+                        }
+                        channelBuffers_[channel][frame] = std::clamp(sample, -1.0f, 1.0f);
+                    }
+                    specSubAppliedCh1 = specSubAppliedCh1 || channel == 0;
+                    specSubAppliedCh2 = specSubAppliedCh2 || channel == 1;
+                }
+                specSubApplied = true;
+            } else {
+                if (!specSubNoiseMagSmoothed_.empty()) {
+                    std::fill(specSubNoiseMagSmoothed_.begin(), specSubNoiseMagSmoothed_.end(), 0.0f);
+                }
+                if (shouldLog) {
+                    ofLogWarning("AudioPipeline::audioIn")
+                        << "Spectral subtraction requested but noise channel or FFT unavailable.";
+                }
+            }
         }
         const double startSample = totalSamplesProcessed_;
         constexpr std::array<ParticipantId, 2> participants = {
@@ -386,6 +560,17 @@ void AudioPipeline::audioIn(const ofSoundBuffer& buffer) {
         signalHealth_.fallbackActive = fallbackActive_;
         signalHealth_.fallbackBlend = fallbackBlend_;
         signalHealth_.fallbackEnvelope = fallbackActive_ ? fallbackEnvelope_ : envelopeLongAvg_;
+        signalHealth_.noiseRms = noiseRms;
+        signalHealth_.noiseChannelPresent = hasNoiseChannel;
+        signalHealth_.noiseGateGain = noiseGateGain_;
+        signalHealth_.noiseGateEngaged = gateEngaged;
+        signalHealth_.specSubActive = specSubApplied;
+        signalHealth_.specSubReady = specSubReady;
+        signalHealth_.specSubAppliedCh1 = specSubAppliedCh1;
+        signalHealth_.specSubAppliedCh2 = specSubAppliedCh2;
+        signalHealth_.specSubAlpha = specSubAlpha_;
+        signalHealth_.specSubFloor = specSubFloor_;
+        signalHealth_.specSubSmoothing = specSubNoiseSmoothing_;
     }
 }
 
