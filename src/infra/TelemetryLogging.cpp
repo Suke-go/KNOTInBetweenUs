@@ -99,7 +99,12 @@ AppConfig AppConfigLoader::load(const std::filesystem::path& configRelativePath)
         config.defaultScene = json.value("defaultScene", "Idle");
         config.operationMode = json.value("operationMode", "debug");
         config.inputGainDb = json.value("inputGainDb", 0.0f);
-        config.noiseGainDb = json.value("noiseGainDb", -23.0f);
+        config.noiseMode = ofToLower(json.value("noiseMode", "specsub"));
+        config.noiseGateThreshold = json.value("noiseGateThreshold", 0.2f);
+        config.noiseGateAttenuation = json.value("noiseGateAttenuation", 0.0f);
+        config.noiseSpecSubAlpha = json.value("noiseSpecSubAlpha", 1.5f);
+        config.noiseSpecSubFloor = json.value("noiseSpecSubFloor", 0.01f);
+        config.noiseSpecSubSmoothing = json.value("noiseSpecSubSmoothing", 0.6f);
 
         const auto guiJson = json.value("gui", ofJson::object());
         config.gui.showControlPanel = guiJson.value("showControlPanel", true);
@@ -144,11 +149,16 @@ ofJson AppConfigLoader::makeDefaultConfig(const std::filesystem::path& absoluteP
 			{"calibrationPath", "../calibration/channel_separator.json"},
 			{"calibrationReportCsv", "../logs/calibration_report.csv"},
 			{"sessionSeed", "config/session_seed.json"},
-                        {"enableSyntheticTelemetry", false},
+			{"enableSyntheticTelemetry", false},
                         {"defaultScene", "Idle"},
                         {"operationMode", "debug"},
                         {"inputGainDb", 0.0},
-                        {"noiseGainDb", -23.0},
+                        {"noiseMode", "specsub"},
+                        {"noiseGateThreshold", 0.2},
+                        {"noiseGateAttenuation", 0.0},
+                        {"noiseSpecSubAlpha", 1.5},
+                        {"noiseSpecSubFloor", 0.01},
+                        {"noiseSpecSubSmoothing", 0.6},
                         {"gui",
                          {
                                  {"showControlPanel", true},

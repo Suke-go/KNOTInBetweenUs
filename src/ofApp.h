@@ -119,6 +119,8 @@ private:
     void onApplyAudioDevices();
     void shutdownSoundStream();
     bool setupSoundStreamWithSelection();
+    void applyNoiseControlParamsIfChanged();
+    knot::audio::AudioPipeline::NoiseMode parseNoiseMode(const std::string& mode) const;
 
     // UI + state
     SceneController sceneController_;
@@ -145,8 +147,13 @@ private:
    ofParameter<float> envelopeP2Param_;
     ofParameter<std::uint32_t> hapticCountParam_;
     ofParameter<bool> simulateSignalParam_;
-    ofParameter<float> inputGainDbParam_;
-    ofParameter<float> noiseGainDbParam_;
+    ofParameter<int> noiseModeParam_;
+    ofParameter<float> noiseGateThresholdParam_;
+    ofParameter<float> noiseGateAttenuationParam_;
+    ofParameter<bool> noiseSpecSubEnabledParam_;
+    ofParameter<float> noiseSpecSubAlphaParam_;
+    ofParameter<float> noiseSpecSubFloorParam_;
+    ofParameter<float> noiseSpecSubSmoothingParam_;
     ofxButton startButton_;
     ofxButton endButton_;
     ofxButton resetButton_;
@@ -240,6 +247,14 @@ private:
     int selectedInputDevice_ = -1;
     int selectedOutputDevice_ = -1;
     int configuredOutputChannels_ = 6;
+    int lastNoiseMode_ = 0;
+    float lastNoiseGateThreshold_ = 0.2f;
+    float lastNoiseGateAttenuation_ = 0.0f;
+    bool lastSpecSubEnabled_ = true;
+    float lastSpecSubAlpha_ = 1.5f;
+    float lastSpecSubFloor_ = 0.01f;
+    float lastSpecSubSmoothing_ = 0.6f;
+    bool specSubAutoDisabled_ = false;
 
     // Bloom renderer
     BloomRenderer bloomRenderer_;

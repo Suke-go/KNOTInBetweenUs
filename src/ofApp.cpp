@@ -147,8 +147,27 @@ void ofApp::setup() {
     controlPanel_.add(hapticCountParam_.set("Haptic Count", 0U, 0U, 4096U));
     simulateTelemetry_ = appConfig_.enableSyntheticTelemetry;
     controlPanel_.add(simulateSignalParam_.set("Synthetic Signal", simulateTelemetry_));
-    controlPanel_.add(inputGainDbParam_.set("Mic Gain (dB)", appConfig_.inputGainDb, -12.0f, 36.0f));
-    controlPanel_.add(noiseGainDbParam_.set("Pink Noise (Generated, dB)", appConfig_.noiseGainDb, -36.0f, -6.0f));
+    auto initialNoiseMode = parseNoiseMode(appConfig_.noiseMode);
+    if (initialNoiseMode != knot::audio::AudioPipeline::NoiseMode::SpecSub) {
+        ofLogWarning("ofApp")
+            << "Spectrum subtraction forced ON by default. Overriding noise mode to SpecSub.";
+        initialNoiseMode = knot::audio::AudioPipeline::NoiseMode::SpecSub;
+    }
+    lastNoiseMode_ = static_cast<int>(initialNoiseMode);
+    lastNoiseGateThreshold_ = appConfig_.noiseGateThreshold;
+    lastNoiseGateAttenuation_ = appConfig_.noiseGateAttenuation;
+    lastSpecSubEnabled_ = true;
+    lastSpecSubAlpha_ = appConfig_.noiseSpecSubAlpha;
+    lastSpecSubFloor_ = appConfig_.noiseSpecSubFloor;
+    lastSpecSubSmoothing_ = appConfig_.noiseSpecSubSmoothing;
+    controlPanel_.add(noiseModeParam_.set("Noise Mode (0=Raw,1=Gate,2=SpecSub)", lastNoiseMode_, 0, 2));
+    controlPanel_.add(noiseGateThresholdParam_.set("Gate Threshold", lastNoiseGateThreshold_, 0.0f, 1.0f));
+    controlPanel_.add(noiseGateAttenuationParam_.set("Gate Attenuation", lastNoiseGateAttenuation_, 0.0f, 1.0f));
+    controlPanel_.add(noiseSpecSubEnabledParam_.set("SS Enabled", lastSpecSubEnabled_));
+    controlPanel_.add(noiseSpecSubAlphaParam_.set("SS Alpha", lastSpecSubAlpha_, 0.0f, 5.0f));
+    controlPanel_.add(noiseSpecSubFloorParam_.set("SS Floor", lastSpecSubFloor_, 0.0f, 0.1f));
+    controlPanel_.add(
+        noiseSpecSubSmoothingParam_.set("SS Noise Smooth", lastSpecSubSmoothing_, 0.0f, 1.0f));
     controlPanel_.add(startButton_.setup("Start Sequence"));
     controlPanel_.add(endButton_.setup("Trigger End"));
     controlPanel_.add(resetButton_.setup("Reset to Idle"));
@@ -194,7 +213,10 @@ void ofApp::setup() {
     audioPipeline_.setup(sampleRate_, bufferSize_);
     audioPipeline_.loadCalibrationFile(calibrationFilePath_);
     audioPipeline_.setInputGainDb(appConfig_.inputGainDb);
-    audioPipeline_.setNoiseGainDb(appConfig_.noiseGainDb);
+    audioPipeline_.setNoiseControlMode(initialNoiseMode);
+    audioPipeline_.setNoiseGate(lastNoiseGateThreshold_, lastNoiseGateAttenuation_);
+    audioPipeline_.setSpectralSubtractionEnabled(lastSpecSubEnabled_);
+    audioPipeline_.setSpectralSubtraction(lastSpecSubAlpha_, lastSpecSubFloor_, lastSpecSubSmoothing_);
     ofLogNotice("ofApp") << "Input gain set to " << appConfig_.inputGainDb << " dB";
     ofLogNotice("ofApp") << "Generated pink noise level set to " << appConfig_.noiseGainDb << " dB";
     audioRouter_.setup(static_cast<float>(sampleRate_));
@@ -311,6 +333,7 @@ void ofApp::update() {
     }
 
     simulateTelemetry_ = simulateSignalParam_.get();
+    applyNoiseControlParamsIfChanged();
 
     if (audioPipeline_.isCalibrationActive()) {
         calibrationSaved_ = false;
@@ -454,6 +477,24 @@ void ofApp::update() {
         limiterReductionDbSmooth_ =
             ofLerp(limiterReductionDbSmooth_, audioPipeline_.lastLimiterReductionDb(), 0.18f);
         signalHealth_ = audioPipeline_.signalHealth();
+
+        // Auto-disable spectral subtraction if MICINPUT3 is missing and re-enable when recovered
+        const bool specSubForced = noiseModeParam_.get() == 2;
+        if (specSubForced && signalHealth_.specSubAutoDisabled && noiseSpecSubEnabledParam_.get()) {
+            noiseSpecSubEnabledParam_.set(false);
+            lastSpecSubEnabled_ = false;
+            audioPipeline_.setSpectralSubtractionEnabled(false);
+            specSubAutoDisabled_ = true;
+            ofLogWarning("ofApp")
+                << "Spectral subtraction disabled automatically: MICINPUT3 not detected.";
+        } else if (specSubForced && specSubAutoDisabled_ && !signalHealth_.specSubAutoDisabled &&
+                   !noiseSpecSubEnabledParam_.get()) {
+            noiseSpecSubEnabledParam_.set(true);
+            lastSpecSubEnabled_ = true;
+            audioPipeline_.setSpectralSubtractionEnabled(true);
+            specSubAutoDisabled_ = false;
+            ofLogNotice("ofApp") << "Spectral subtraction re-enabled: MICINPUT3 restored.";
+        }
     } else {
         // Fallback to fake signal if no metrics available or using synthetic mode
         // This ensures visible output even when there's no audio input
@@ -742,21 +783,30 @@ void ofApp::audioIn(ofSoundBuffer& input) {
         
         // Calculate input signal level
         if (input.getNumChannels() >= 2 && input.getNumFrames() > 0) {
-            float maxL = 0.0f, maxR = 0.0f;
-            float rmsL = 0.0f, rmsR = 0.0f;
+            float maxL = 0.0f, maxR = 0.0f, maxNoise = 0.0f;
+            float rmsL = 0.0f, rmsR = 0.0f, rmsNoise = 0.0f;
             const float* data = input.getBuffer().data();
+            const std::size_t numChannels = input.getNumChannels();
+            const bool hasNoiseChannel = numChannels > 2;
             for (std::size_t i = 0; i < input.getNumFrames(); ++i) {
-                const float left = data[i * 2];
-                const float right = data[i * 2 + 1];
+                const float left = data[i * numChannels];
+                const float right = data[i * numChannels + 1];
+                const float noise = hasNoiseChannel ? data[i * numChannels + 2] : 0.0f;
                 maxL = std::max(maxL, std::fabs(left));
                 maxR = std::max(maxR, std::fabs(right));
+                maxNoise = std::max(maxNoise, std::fabs(noise));
                 rmsL += left * left;
                 rmsR += right * right;
+                rmsNoise += noise * noise;
             }
             rmsL = std::sqrt(rmsL / input.getNumFrames());
             rmsR = std::sqrt(rmsR / input.getNumFrames());
-            ofLogNotice("ofApp::audioIn") << "Input level - L: max=" << maxL << " rms=" << rmsL 
-                                          << " | R: max=" << maxR << " rms=" << rmsR;
+            rmsNoise = hasNoiseChannel ? std::sqrt(rmsNoise / input.getNumFrames()) : 0.0f;
+            ofLogNotice("ofApp::audioIn") << "Input level - L: max=" << maxL << " rms=" << rmsL
+                                          << " | R: max=" << maxR << " rms=" << rmsR
+                                          << (hasNoiseChannel ? " | CH3(noise): max=" + ofToString(maxNoise) +
+                                                                     " rms=" + ofToString(rmsNoise)
+                                                              : " | CH3(noise): N/A");
         }
         lastAudioInDebugTime = nowSeconds;
     }
@@ -786,11 +836,18 @@ void ofApp::audioIn(ofSoundBuffer& input) {
         if (input.getNumChannels() < 2) {
             static double lastWarningTime = 0.0;
             if (nowSeconds - lastWarningTime > 5.0) {
-                ofLogWarning("ofApp::audioIn") << "Input buffer has less than 2 channels: " 
+                ofLogWarning("ofApp::audioIn") << "Input buffer has less than 2 channels: "
                                                << input.getNumChannels();
                 lastWarningTime = nowSeconds;
             }
             return;
+        } else if (input.getNumChannels() < 3) {
+            static double lastNoiseWarningTime = 0.0;
+            if (nowSeconds - lastNoiseWarningTime > 5.0) {
+                ofLogWarning("ofApp::audioIn") << "Input buffer has only " << input.getNumChannels()
+                                                << " channels. CH3 noise reference is unavailable.";
+                lastNoiseWarningTime = nowSeconds;
+            }
         }
         audioPipeline_.audioIn(input);
     }
@@ -1573,10 +1630,14 @@ bool ofApp::setupSoundStreamWithSelection() {
     if (selectedInputDevice_ >= 0 && selectedInputDevice_ < static_cast<int>(inputDevices_.size())) {
         const auto& inDevice = inputDevices_[selectedInputDevice_];
         settings.setInDevice(inDevice);
-        settings.numInputChannels = std::min<std::size_t>(2, inDevice.inputChannels);
+        settings.numInputChannels = std::min<std::size_t>(3, inDevice.inputChannels);
         if (settings.numInputChannels == 0) {
             ofLogWarning("ofApp") << "選択した入力デバイス '" << inDevice.name
                                   << "' は入力チャンネルを提供しません。";
+        } else if (settings.numInputChannels < 3) {
+            ofLogWarning("ofApp") << "入力チャンネルが " << settings.numInputChannels
+                                  << "ch しかありません。CH3 をノイズ参照として使うには"
+                                  << " 3ch 以上のデバイスを選択してください。";
         }
     } else {
         settings.numInputChannels = 0;
@@ -1617,6 +1678,67 @@ bool ofApp::setupSoundStreamWithSelection() {
         soundStreamActive_ = false;
         updateAudioDeviceLabels();
         return false;
+    }
+}
+
+knot::audio::AudioPipeline::NoiseMode ofApp::parseNoiseMode(const std::string& mode) const {
+    const std::string lower = ofToLower(mode);
+    if (lower == "gate") {
+        return knot::audio::AudioPipeline::NoiseMode::Gate;
+    }
+    if (lower == "specsub" || lower == "spectral" || lower == "spec_sub") {
+        return knot::audio::AudioPipeline::NoiseMode::SpecSub;
+    }
+    return knot::audio::AudioPipeline::NoiseMode::SpecSub;
+}
+
+void ofApp::applyNoiseControlParamsIfChanged() {
+    const int modeSelection = noiseModeParam_.get();
+    if (modeSelection != lastNoiseMode_) {
+        knot::audio::AudioPipeline::NoiseMode mode = knot::audio::AudioPipeline::NoiseMode::Raw;
+        if (modeSelection == 1) {
+            mode = knot::audio::AudioPipeline::NoiseMode::Gate;
+        } else if (modeSelection == 2) {
+            mode = knot::audio::AudioPipeline::NoiseMode::SpecSub;
+        }
+        audioPipeline_.setNoiseControlMode(mode);
+        lastNoiseMode_ = modeSelection;
+        ofLogNotice("ofApp") << "Noise mode set to "
+                              << (mode == knot::audio::AudioPipeline::NoiseMode::Gate
+                                      ? "Gate"
+                                      : (mode == knot::audio::AudioPipeline::NoiseMode::SpecSub ? "SpecSub" : "Raw"));
+    }
+
+    const float threshold = std::clamp(noiseGateThresholdParam_.get(), 0.0f, 1.0f);
+    const float attenuation = std::clamp(noiseGateAttenuationParam_.get(), 0.0f, 1.0f);
+    if (std::fabs(threshold - lastNoiseGateThreshold_) > 1e-6f ||
+        std::fabs(attenuation - lastNoiseGateAttenuation_) > 1e-6f) {
+        audioPipeline_.setNoiseGate(threshold, attenuation);
+        lastNoiseGateThreshold_ = threshold;
+        lastNoiseGateAttenuation_ = attenuation;
+        ofLogNotice("ofApp") << "Noise gate updated - threshold: " << threshold
+                              << " attenuation: " << attenuation;
+    }
+
+    const bool specSubEnabled = noiseSpecSubEnabledParam_.get();
+    if (specSubEnabled != lastSpecSubEnabled_) {
+        audioPipeline_.setSpectralSubtractionEnabled(specSubEnabled);
+        lastSpecSubEnabled_ = specSubEnabled;
+        ofLogNotice("ofApp") << "Spectral subtraction " << (specSubEnabled ? "enabled" : "disabled")
+                              << " via control panel.";
+    }
+
+    const float alpha = std::clamp(noiseSpecSubAlphaParam_.get(), 0.0f, 5.0f);
+    const float floor = std::clamp(noiseSpecSubFloorParam_.get(), 0.0f, 0.1f);
+    const float smoothing = std::clamp(noiseSpecSubSmoothingParam_.get(), 0.0f, 1.0f);
+    if (std::fabs(alpha - lastSpecSubAlpha_) > 1e-5f || std::fabs(floor - lastSpecSubFloor_) > 1e-5f ||
+        std::fabs(smoothing - lastSpecSubSmoothing_) > 1e-5f) {
+        audioPipeline_.setSpectralSubtraction(alpha, floor, smoothing);
+        lastSpecSubAlpha_ = alpha;
+        lastSpecSubFloor_ = floor;
+        lastSpecSubSmoothing_ = smoothing;
+        ofLogNotice("ofApp") << "Spectral subtraction updated - alpha: " << alpha << " floor: " << floor
+                              << " smoothing: " << smoothing;
     }
 }
 

@@ -48,7 +48,12 @@ struct AppConfig {
         std::string defaultScene = "Idle";
         std::string operationMode = "debug";
         float inputGainDb = 0.0f;
-        float noiseGainDb = -23.0f;
+        std::string noiseMode = "specsub";
+        float noiseGateThreshold = 0.2f;
+        float noiseGateAttenuation = 0.0f;
+        float noiseSpecSubAlpha = 1.5f;
+        float noiseSpecSubFloor = 0.01f;
+        float noiseSpecSubSmoothing = 0.6f;
         GuiConfig gui;
         std::filesystem::path sceneTimingConfigPath;
         std::filesystem::path sceneTransitionCsvPath;
